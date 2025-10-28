@@ -82,14 +82,19 @@
     "type": "bool",
     "default": false
   },
-    "subscribed_users": {
-      "description": "订阅用户列表（用户ID，支持直接添加/删除）",
-      "type": "list",
-      "default": [],
-      "items": {
-        "type": "string"
-      }
-    },
+  "reply_interval_seconds": {
+    "description": "多用户同时触发时的间隔秒数（避免API限流，推荐10-20）",
+    "type": "int",
+    "default": 20
+  },
+  "subscribed_users": {
+    "description": "订阅用户列表（用户ID，支持直接添加/删除）",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  },
   "_special": {
     "description": "可视化选择默认聊天模型/人格（可选）",
     "type": "object",

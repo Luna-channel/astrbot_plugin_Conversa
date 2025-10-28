@@ -1,6 +1,6 @@
-name: AIReplay
-author: LumineStory
-version: 1.1.0
-description: 主动定时触发 AI 自然切入回复 + 免打扰 + 最近聊天记录 + 人格 + 定时提醒
-desc: 主动定时触发 AI 自然切入回复 + 免打扰 + 最近聊天记录 + 人格 + 定时提醒
-repo: https://github.com/oyxning/astrbot_plugin_AIReplay
+name: Conversa
+display_name: Conversa 主动回复插件
+desc: AI 定时主动续聊 · 支持人格与上下文记忆
+version: 1.0.0
+author: 柯尔
+repo: https://github.com/Luna-channel/astrbot_plugin_Conversa
