@@ -105,6 +105,13 @@ class Conversa(Star):
         self._load_session_states()
         self._sync_subscribed_users_from_config()  # 从配置同步订阅列表到内部状态
 
+        # 获取配置的辅助函数
+        self._general_cfg = self.cfg.get("general_settings") or {}
+        self._daily_cfg = self.cfg.get("daily_greetings") or {}
+        self._idle_cfg = self.cfg.get("idle_reminder") or {}
+        self._reminder_cfg = self.cfg.get("proactive_reminder") or {}
+        self._special_cfg = self.cfg.get("_special") or {}
+
         self._loop_task = asyncio.create_task(self._scheduler_loop())
         logger.info("[Conversa] scheduler started.")
 
@@ -151,9 +158,13 @@ class Conversa(Star):
                     subscribed_ids.append(user_id)
             
             logger.debug(f"[Conversa] _save_user_profiles: 同步 {len(subscribed_ids)} 个订阅用户到配置: {subscribed_ids}")
-            self.cfg["subscribed_users"] = subscribed_ids
-            self.cfg.save_config()
-            logger.debug(f"[Conversa] _save_user_profiles: 配置已保存")
+            
+            # 更新嵌套的配置
+            if "subscribed_users" in self._general_cfg:
+                self._general_cfg["subscribed_users"] = subscribed_ids
+                self.cfg["general_settings"] = self._general_cfg
+                self.cfg.save_config()
+                logger.debug(f"[Conversa] _save_user_profiles: 配置已保存")
 
         except Exception as e:
             logger.error(f"[Conversa] save user profiles error: {e}")
@@ -243,7 +254,7 @@ class Conversa(Star):
         - 需要遍历所有 _states，匹配 ID 后缀来应用订阅状态
         """
         try:
-            config_subscribed_ids = self.cfg.get("subscribed_users") or []
+            config_subscribed_ids = self._general_cfg.get("subscribed_users") or []
             if not isinstance(config_subscribed_ids, list):
                 logger.warning(f"[Conversa] subscribed_users 配置格式错误，应为列表")
                 return
@@ -295,13 +306,13 @@ class Conversa(Star):
         profile = self._user_profiles[umo]
         context_cache = self._context_caches[umo]
 
-        now_ts = _now_tz(self.cfg.get("timezone") or None).timestamp()
+        now_ts = _now_tz(self._general_cfg.get("timezone") or None).timestamp()
         st.last_ts = now_ts
         st.last_user_reply_ts = now_ts  # 记录用户最后回复时间
         st.consecutive_no_reply_count = 0  # 重置无回复计数
 
         # 检查订阅状态：支持自动订阅模式
-        if (self.cfg.get("subscribe_mode") or "manual") == "auto":
+        if (self._general_cfg.get("subscribe_mode") or "manual") == "auto":
             profile.subscribed = True
 
         # 只为订阅用户记录上下文缓存（双向对话）
@@ -316,18 +327,15 @@ class Conversa(Star):
 
         # 计算下一次延时问候触发时间（优先使用用户个性化设置）
         try:
-            if profile.subscribed and bool(self.cfg.get("enable_idle_greetings", True)):
+            if profile.subscribed and bool(self._idle_cfg.get("enable", True)):
                 delay_m = profile.idle_after_minutes  # 优先使用用户设置
                 
                 # 如果用户未设置，则使用全局设置
                 if delay_m is None:
-                    mode = (self.cfg.get("idle_trigger_mode") or "fixed").strip().lower()
-                    if mode == "random_window":
-                        min_m = int(self.cfg.get("idle_after_min_minutes") or 30)
-                        max_m = int(self.cfg.get("idle_after_max_minutes") or 90)
-                        delay_m = random.randint(min_m, max_m) if max_m > min_m else min_m
-                    else:  # fixed mode
-                        delay_m = int(self.cfg.get("idle_after_minutes") or 45)
+                    base_delay_m = int(self._idle_cfg.get("after_minutes") or 45)
+                    fluctuation_m = int(self._idle_cfg.get("fluctuation_minutes") or 15)
+                    delay_m = base_delay_m + random.randint(-fluctuation_m, fluctuation_m)
+                    delay_m = max(30, delay_m) # 确保不低于30分钟
                 
                 st.next_idle_ts = now_ts + delay_m * 60
         except Exception as e:
@@ -376,26 +384,28 @@ class Conversa(Star):
         if " debug" in lower:
             # 调试信息
             debug_info = []
-            debug_info.append(f"插件启用状态: {self.cfg.get('enable', True)}")
-            debug_info.append(f"订阅模式: {self.cfg.get('subscribe_mode', 'manual')}")
+            debug_info.append(f"插件启用状态: {self._general_cfg.get('enable', True)}")
+            debug_info.append(f"订阅模式: {self._general_cfg.get('subscribe_mode', 'manual')}")
             debug_info.append(f"当前用户: {event.unified_msg_origin}")
             umo = event.unified_msg_origin
             if umo not in self._states:
                 self._states[umo] = SessionState()
             debug_info.append(f"用户订阅状态: {self._user_profiles.get(umo).subscribed if self._user_profiles.get(umo) else False}")
-            debug_info.append(f"间隔触发设置: {self.cfg.get('after_last_msg_minutes', 0)}分钟")
-            debug_info.append(f"免打扰时间: {self.cfg.get('quiet_hours', '')}")
-            debug_info.append(f"最大无回复天数: {self.cfg.get('max_no_reply_days', 0)}")
+            debug_info.append(f"延时基准: {self._idle_cfg.get('after_minutes', 0)}分钟")
+            debug_info.append(f"免打扰时间: {self._general_cfg.get('quiet_hours', '')}")
+            debug_info.append(f"最大无回复天数: {self._general_cfg.get('max_no_reply_days', 0)}")
             yield reply("🔍 调试信息:\n" + "\n".join(debug_info))
             return
 
         if " on" in lower:
-            self.cfg["enable"] = True
+            self._general_cfg["enable"] = True
+            self.cfg["general_settings"] = self._general_cfg
             self.cfg.save_config()
             yield reply("✅ 已启用 Conversa")
             return
         if " off" in lower:
-            self.cfg["enable"] = False
+            self._general_cfg["enable"] = False
+            self.cfg["general_settings"] = self._general_cfg
             self.cfg.save_config()
             yield reply("🛑 已停用 Conversa")
             return
@@ -424,7 +434,7 @@ class Conversa(Star):
             profile = self._user_profiles.get(umo)
             st = self._states.get(umo)
             # 计算 next_idle_ts 友好显示
-            tz = self.cfg.get("timezone") or None
+            tz = self._general_cfg.get("timezone") or None
             next_idle_str = "未计划"
             if st and st.next_idle_ts and st.next_idle_ts > 0:
                 try:
@@ -433,18 +443,18 @@ class Conversa(Star):
                 except Exception:
                     next_idle_str = str(st.next_idle_ts)
             info = {
-                "enable": self.cfg.get("enable"),
-                "timezone": self.cfg.get("timezone"),
-                "enable_daily_greetings": self.cfg.get("enable_daily_greetings", True),
-                "enable_idle_greetings": self.cfg.get("enable_idle_greetings", True),
-                "idle_trigger_mode": self.cfg.get("idle_trigger_mode", "fixed"),
-                "idle_after_minutes": self.cfg.get("idle_after_minutes"),
-                "idle_after_min_minutes": self.cfg.get("idle_after_min_minutes"),
-                "idle_after_max_minutes": self.cfg.get("idle_after_max_minutes"),
+                "enable": self._general_cfg.get("enable"),
+                "timezone": self._general_cfg.get("timezone"),
+                "enable_daily_greetings": self._daily_cfg.get("enable", True),
+                "enable_idle_greetings": self._idle_cfg.get("enable", True),
+                "idle_after_minutes": self._idle_cfg.get("after_minutes"),
+                "idle_random_fluctuation_minutes": self._idle_cfg.get("fluctuation_minutes"),
                 "next_idle_at": next_idle_str,
-                "daily": self.cfg.get("daily_prompts"),
-                "quiet_hours": self.cfg.get("quiet_hours"),
-                "history_depth": self.cfg.get("history_depth"),
+                "daily_slot1_time": (self._daily_cfg.get("slot1") or {}).get("time"),
+                "daily_slot2_time": (self._daily_cfg.get("slot2") or {}).get("time"),
+                "daily_slot3_time": (self._daily_cfg.get("slot3") or {}).get("time"),
+                "quiet_hours": self._general_cfg.get("quiet_hours"),
+                "history_depth": self._general_cfg.get("history_depth"),
                 "subscribed": bool(profile and profile.subscribed),
                 "user_idle_after_minutes": profile.idle_after_minutes if profile else None,
                 "user_daily_reminders_enabled": profile.daily_reminders_enabled if profile else True,
@@ -453,34 +463,52 @@ class Conversa(Star):
             yield reply("当前配置/状态：\n" + json.dumps(info, ensure_ascii=False, indent=2))
             return
 
-        m = re.search(r"set\s+after\s+(\d+)", lower)
+        m = re.search(r"set\s+after\s+(\d+)", text, re.I)
         if m:
-            self.cfg["after_last_msg_minutes"] = int(m.group(1))
-            self.cfg.save_config()
-            yield reply(f"⏱️ 已设置 last_msg 后触发：{m.group(1)} 分钟")
+            umo = event.unified_msg_origin
+            profile = self._user_profiles.get(umo)
+            if not profile:
+                self._user_profiles[umo] = UserProfile()
+                profile = self._user_profiles[umo]
+
+            try:
+                hours = int(m.group(1))
+                if 2 <= hours <= 48:
+                    profile.idle_after_minutes = hours * 60
+                    self._save_user_profiles()
+                    yield reply(f"⏱️ 已为您设置专属延时问候：{hours} 小时后触发（会叠加后台随机波动）")
+                else:
+                    yield reply("⏱️ 请输入2到48之间的小时数。")
+            except ValueError:
+                yield reply("⏱️ 请输入有效的小时数。")
             return
 
         m = re.search(r"set\s+daily([1-3])\s+(\d{1,2}:\d{2})", lower)
         if m:
-            n = m.group(1)
+            n = int(m.group(1))
             t = m.group(2)
-            d = self.cfg.get("daily_prompts") or {}
-            d[f"time{n}"] = t
-            self.cfg["daily_prompts"] = d
+            
+            slot_cfg = self._daily_cfg.get(f"slot{n}") or {}
+            slot_cfg["time"] = t
+            self._daily_cfg[f"slot{n}"] = slot_cfg
+            
+            self.cfg["daily_greetings"] = self._daily_cfg
             self.cfg.save_config()
             yield reply(f"🗓️ 已设置 daily{n}：{t}")
             return
 
         m = re.search(r"set\s+quiet\s+(\d{1,2}:\d{2})-(\d{1,2}:\d{2})", lower)
         if m:
-            self.cfg["quiet_hours"] = f"{m.group(1)}-{m.group(2)}"
+            self._general_cfg["quiet_hours"] = f"{m.group(1)}-{m.group(2)}"
+            self.cfg["general_settings"] = self._general_cfg
             self.cfg.save_config()
-            yield reply(f"🔕 已设置免打扰：{self.cfg['quiet_hours']}")
+            yield reply(f"🔕 已设置免打扰：{self._general_cfg['quiet_hours']}")
             return
 
         mp = re.search(r"set\s+history\s+(\d+)", lower)
         if mp:
-            self.cfg["history_depth"] = int(mp.group(1))
+            self._general_cfg["history_depth"] = int(mp.group(1))
+            self.cfg["general_settings"] = self._general_cfg
             self.cfg.save_config()
             yield reply(f"🧵 已设置历史条数：{mp.group(1)}")
             return
@@ -491,6 +519,10 @@ class Conversa(Star):
             return
 
         if " remind " in lower or lower.endswith(" remind"):
+            if not bool(self._reminder_cfg.get("enable", True)):
+                yield reply("提醒功能已被管理员禁用。")
+                return
+
             parts = text.split()
             if len(parts) >= 3 and parts[1].lower() == "remind":
                 sub = parts[2].lower()
@@ -542,7 +574,7 @@ class Conversa(Star):
             "/conversa unwatch - 退订当前会话\n"
             "/conversa show - 显示当前配置\n"
             "/conversa debug - 显示调试信息\n"
-            "/conversa set after <分钟> - 设置间隔触发\n"
+            "/conversa set after <小时> - 设置专属延时问候(2-48小时)\n"
             "/conversa set daily[1-3] <HH:MM> - 设置三个每日定时触发时间\n"
             "/conversa set quiet <HH:MM-HH:MM> - 设置免打扰\n"
             "/conversa set history <N> - 设置历史条数\n"
@@ -720,21 +752,25 @@ class Conversa(Star):
         
         注意：每个触发条件都会记录一个唯一的 tag，防止同一时刻重复触发
         """
-        if not self.cfg.get("enable", True):
+        if not self._general_cfg.get("enable", True):
             logger.debug("[Conversa] Tick: 插件被停用，跳过")
             return
         
         logger.debug("[Conversa] Tick: 开始检查...")
 
-        tz = self.cfg.get("timezone") or None
+        tz = self._general_cfg.get("timezone") or None
         now = _now_tz(tz)
-        quiet = self.cfg.get("quiet_hours", "") or ""
-        hist_n = int(self.cfg.get("history_depth") or 8)
+        quiet = self._general_cfg.get("quiet_hours", "") or ""
+        hist_n = int(self._general_cfg.get("history_depth") or 8)
+        reply_interval = int(self._general_cfg.get("reply_interval_seconds") or 10)
 
-        daily = self.cfg.get("daily_prompts") or {}
-        t1 = _parse_hhmm(str(daily.get("time1", "") or ""))
-        t2 = _parse_hhmm(str(daily.get("time2", "") or ""))
-        t3 = _parse_hhmm(str(daily.get("time3", "") or ""))
+        daily1 = self._daily_cfg.get("slot1") or {}
+        daily2 = self._daily_cfg.get("slot2") or {}
+        daily3 = self._daily_cfg.get("slot3") or {}
+
+        t1 = _parse_hhmm(str(daily1.get("time", "") or "")) if daily1.get("enable", True) else None
+        t2 = _parse_hhmm(str(daily2.get("time", "") or "")) if daily2.get("enable", True) else None
+        t3 = _parse_hhmm(str(daily3.get("time", "") or "")) if daily3.get("enable", True) else None
 
         # 确保时间点唯一，避免重复触发
         times = {t for t in (t1, t2, t3) if t}
@@ -765,12 +801,12 @@ class Conversa(Star):
             logger.debug(f"[Conversa] Tick: 检查 {umo}, last_ts={st.last_ts}, last_fired_tag={st.last_fired_tag}")
 
             # 延时问候（基于 next_idle_ts 和用户个性化设置）
-            if bool(self.cfg.get("enable_idle_greetings", True)):
+            if bool(self._idle_cfg.get("enable", True)):
                 st = self._states.get(umo)  # 获取运行时状态
                 if st and st.next_idle_ts and now.timestamp() >= st.next_idle_ts:
                     tag = f"idle@{now.strftime('%Y-%m-%d %H:%M')}"
                     if st.last_fired_tag != tag:
-                        idle_prompts = self.cfg.get("idle_prompt_templates") or []
+                        idle_prompts = self._idle_cfg.get("prompt_templates") or []
                         if idle_prompts:
                             prompt_template = random.choice(idle_prompts)
                             logger.info(f"[Conversa] Tick: 触发延时问候 {umo}")
@@ -779,60 +815,68 @@ class Conversa(Star):
                                 st.last_fired_tag = tag
                                 # 触发后清零 next_idle_ts，等待用户下次消息重置
                                 st.next_idle_ts = 0.0
+                                if reply_interval > 0:
+                                    await asyncio.sleep(reply_interval)
                             else:
                                 st.consecutive_no_reply_count += 1
                     else:
                         logger.debug(f"[Conversa] Tick: {umo} 已触发过 {tag}")
 
             # 每日定时1
-            if bool(self.cfg.get("enable_daily_greetings", True)) and profile.daily_reminders_enabled:
+            if bool(self._daily_cfg.get("enable", True)) and profile.daily_reminders_enabled:
                 st = self._states.get(umo)  # 获取运行时状态
                 if st and t1 and now.hour == t1[0] and now.minute == t1[1]:
                     if st.last_fired_tag != curr_min_tag_1:
-                        prompt_template = daily.get("prompt1")
+                        prompt_template = daily1.get("prompt")
                         if prompt_template:
                             logger.info(f"[Conversa] Tick: 触发每日定时1回复 {umo}")
                             ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
                             if ok:
                                 st.last_fired_tag = curr_min_tag_1
+                                if reply_interval > 0:
+                                    await asyncio.sleep(reply_interval)
                             else:
                                 st.consecutive_no_reply_count += 1
                     else:
                         logger.debug(f"[Conversa] Tick: {umo} 已触发过 {curr_min_tag_1}")
                         
             # 每日定时2
-            if bool(self.cfg.get("enable_daily_greetings", True)) and profile.daily_reminders_enabled:
+            if bool(self._daily_cfg.get("enable", True)) and profile.daily_reminders_enabled:
                 st = self._states.get(umo)  # 获取运行时状态
                 if st and t2 and now.hour == t2[0] and now.minute == t2[1]:
                     if st.last_fired_tag != curr_min_tag_2:
-                        prompt_template = daily.get("prompt2")
+                        prompt_template = daily2.get("prompt")
                         if prompt_template:
                             logger.info(f"[Conversa] Tick: 触发每日定时2回复 {umo}")
                             ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
                             if ok:
                                 st.last_fired_tag = curr_min_tag_2
+                                if reply_interval > 0:
+                                    await asyncio.sleep(reply_interval)
                             else:
                                 st.consecutive_no_reply_count += 1
                     else:
                         logger.debug(f"[Conversa] Tick: {umo} 已触发过 {curr_min_tag_2}")
 
             # 每日定时3
-            if bool(self.cfg.get("enable_daily_greetings", True)) and profile.daily_reminders_enabled:
+            if bool(self._daily_cfg.get("enable", True)) and profile.daily_reminders_enabled:
                 st = self._states.get(umo)  # 获取运行时状态
                 if st and t3 and now.hour == t3[0] and now.minute == t3[1]:
                     if st.last_fired_tag != curr_min_tag_3:
-                        prompt_template = daily.get("prompt3")
+                        prompt_template = daily3.get("prompt")
                         if prompt_template:
                             logger.info(f"[Conversa] Tick: 触发每日定时3回复 {umo}")
                             ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
                             if ok:
                                 st.last_fired_tag = curr_min_tag_3
+                                if reply_interval > 0:
+                                    await asyncio.sleep(reply_interval)
                             else:
                                 st.consecutive_no_reply_count += 1
                     else:
                         logger.debug(f"[Conversa] Tick: {umo} 已触发过 {curr_min_tag_3}")
 
-        await self._check_reminders(now, tz)
+        await self._check_reminders(now, tz, reply_interval)
         self._save_session_states()
 
     async def _should_auto_unsubscribe(self, umo: str, profile: UserProfile, st: SessionState, now: datetime) -> bool:
@@ -855,7 +899,7 @@ class Conversa(Star):
         - 则自动将该用户的 subscribed 状态设为 False
         - 这样可以避免长期无人回复的会话持续消耗 LLM 额度
         """
-        max_days = int(self.cfg.get("max_no_reply_days") or 0)
+        max_days = int(self._general_cfg.get("max_no_reply_days") or 0)
         if max_days <= 0:
             return False
 
@@ -885,10 +929,10 @@ class Conversa(Star):
             False: 发送失败或回复为空
         """
         try:
-            hist_n = int(self.cfg.get("history_depth") or 8)
+            hist_n = int(self._general_cfg.get("history_depth") or 8)
             
             # 1. 获取 Provider 和 Conversation (与 _proactive_reply 逻辑类似)
-            fixed_provider = (self.cfg.get("_special") or {}).get("provider") or ""
+            fixed_provider = self._special_cfg.get("provider") or ""
             provider = self.context.get_provider_by_id(fixed_provider) if fixed_provider else self.context.get_using_provider(umo=umo)
             if not provider:
                 logger.warning(f"[Conversa] reminder provider missing for {umo}")
@@ -908,7 +952,7 @@ class Conversa(Star):
                 contexts = contexts[-hist_n:]
 
             # 4. 构造提醒专用的 Prompt
-            prompt_template = self.cfg.get("reminder_prompt_template") or "用户提醒：{reminder_content}"
+            prompt_template = self._reminder_cfg.get("prompt_template") or "用户提醒：{reminder_content}"
             prompt = prompt_template.format(reminder_content=reminder_content)
 
             logger.info(f"[Conversa] 触发 AI 提醒 for {umo}: {reminder_content}")
@@ -942,13 +986,13 @@ class Conversa(Star):
         persona_obj = None
         
         # 优先使用配置文件中的自定义人格
-        if (self.cfg.get("persona_override") or "").strip():
-            system_prompt = self.cfg.get("persona_override")
+        if (self._general_cfg.get("persona_override") or "").strip():
+            system_prompt = self._general_cfg.get("persona_override")
             logger.debug(f"[Conversa] 使用配置文件中的自定义人格")
         else:
             persona_mgr = getattr(self.context, "persona_manager", None)
             if persona_mgr:
-                fixed_persona = (self.cfg.get("_special") or {}).get("persona") or ""
+                fixed_persona = self._special_cfg.get("persona") or ""
                 persona_id = fixed_persona or (getattr(conversation, "persona_id", "") or "")
                 
                 if persona_id:
@@ -1003,7 +1047,7 @@ class Conversa(Star):
                             
         return system_prompt or ""
 
-    async def _check_reminders(self, now: datetime, tz: Optional[str]):
+    async def _check_reminders(self, now: datetime, tz: Optional[str], reply_interval: int):
         """
         检查并触发到期的提醒事项
         
@@ -1011,6 +1055,9 @@ class Conversa(Star):
         1. 一次性提醒：格式 "YYYY-MM-DD HH:MM"，触发后自动删除
         2. 每日提醒：格式 "HH:MM|daily"，每天相同时间触发，不删除
         """
+        if not bool(self._reminder_cfg.get("enable", True)):
+            return
+
         fired_ids = []
         for rid, r in list(self._reminders.items()): # 使用 list 副本以安全地在循环中删除
             try:
@@ -1021,13 +1068,18 @@ class Conversa(Star):
                         continue
                     if now.hour == t[0] and now.minute == t[1]:
                         # 调用 AI 提醒
-                        await self._proactive_reminder_reply(r.umo, r.content)
+                        ok = await self._proactive_reminder_reply(r.umo, r.content)
+                        if ok and reply_interval > 0:
+                            await asyncio.sleep(reply_interval)
                 else:
                     dt = datetime.strptime(r.at, "%Y-%m-%d %H:%M")
                     if now.strftime("%Y-%m-%d %H:%M") == dt.strftime("%Y-%m-%d %H:%M"):
                         # 调用 AI 提醒
-                        await self._proactive_reminder_reply(r.umo, r.content)
-                        fired_ids.append(rid)
+                        ok = await self._proactive_reminder_reply(r.umo, r.content)
+                        if ok:
+                            fired_ids.append(rid)
+                            if reply_interval > 0:
+                                await asyncio.sleep(reply_interval)
             except Exception as e:
                 logger.error(f"[Conversa] 检查提醒 {r.id} 时出错: {e}")
                 continue
@@ -1072,7 +1124,7 @@ class Conversa(Star):
         - 上下文获取要有多层降级策略，确保健壮性
         """
         try:
-            fixed_provider = (self.cfg.get("_special") or {}).get("provider") or ""
+            fixed_provider = self._special_cfg.get("provider") or ""
             provider = None
             if fixed_provider:
                 provider = self.context.get_provider_by_id(fixed_provider)
@@ -1117,12 +1169,12 @@ class Conversa(Star):
                         last_ai = m.get("content", "")
                     if last_user and last_ai:
                         break
-                prompt = prompt_template.format(now=_fmt_now(self.cfg.get("time_format") or "%Y-%m-%d %H:%M", tz), last_user=last_user, last_ai=last_ai, umo=umo)
+                prompt = prompt_template.format(now=_fmt_now(self._general_cfg.get("time_format") or "%Y-%m-%d %H:%M", tz), last_user=last_user, last_ai=last_ai, umo=umo)
             else:
                 # 降级为默认提示词
                 prompt = "请自然地延续对话，与用户继续交流。"
 
-            if self.cfg.get("debug_mode", False):
+            if self._general_cfg.get("debug_mode", False):
                 logger.info(f"[Conversa] ========== 调试模式开始 ==========")
                 logger.info(f"[Conversa] 用户: {umo}")
                 logger.info(f"[Conversa] 系统提示词长度: {len(system_prompt) if system_prompt else 0} 字符")
@@ -1152,8 +1204,8 @@ class Conversa(Star):
             if not text.strip():
                 return False
 
-            if bool(self.cfg.get("append_time_field")):
-                text = f"[{_fmt_now(self.cfg.get('time_format') or '%Y-%m-%d %H:%M', tz)}] " + text
+            if bool(self._general_cfg.get("append_time_field")):
+                text = f"[{_fmt_now(self._general_cfg.get('time_format') or '%Y-%m-%d %H:%M', tz)}] " + text
 
             await self._send_text(umo, text)
             logger.info(f"[Conversa] 已发送主动回复给 {umo}: {text[:50]}...")
@@ -1239,23 +1291,12 @@ class Conversa(Star):
             
             # 清除用户配置
             try:
-                # 重置所有配置项为默认值
-                self.cfg["enable"] = True
-                self.cfg["custom_prompts"] = []
-                self.cfg["max_no_reply_days"] = 0
-                self.cfg["persona_override"] = ""
-                self.cfg["quiet_hours"] = ""
-                self.cfg["timezone"] = ""
-                self.cfg["time_format"] = "%Y-%m-%d %H:%M"
-                self.cfg["history_depth"] = 8
-                self.cfg["after_last_msg_minutes"] = 0
-                self.cfg["append_time_field"] = False
-                self.cfg["daily"] = {}
-                self.cfg["daily_prompts"] = {} # 新增：清理每日定时提示词
-                self.cfg["idle_prompt_templates"] = [] # 新增：清理空闲触发提示词
-                self.cfg["subscribe_mode"] = "manual"
-                self.cfg["debug_mode"] = False
-                self.cfg["_special"] = {}
+                # 通过将空字典写入来清除配置
+                self.cfg["general_settings"] = {}
+                self.cfg["daily_greetings"] = {}
+                self.cfg["idle_reminder"] = {}
+                self.cfg["proactive_reminder"] = {}
+                
                 # 保存配置以确保清除生效
                 self.cfg.save_config()
                 logger.info("[Conversa] 已清除用户配置")

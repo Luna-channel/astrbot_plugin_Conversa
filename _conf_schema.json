@@ -1,173 +1,231 @@
 {
-  "enable": {
-    "description": "启用/停用 AIReplay",
-    "type": "bool",
-    "default": true
+  "general_settings_group": {
+    "type": "group",
+    "description": "通用设置"
   },
-  "timezone": {
-    "description": "IANA 时区（留空使用系统时区），例如 Asia/Shanghai、America/Los_Angeles",
-    "type": "string",
-    "default": ""
-  },
-  "after_last_msg_minutes": {
-    "description": "最后一条消息后多久主动触发（分钟）。0 表示关闭该触发器",
-    "type": "int",
-    "default": 0
-  },
-  "idle_prompt_templates": {
-    "description": "【间隔触发】的提示词模板列表（用户N分钟未回复时触发，会从中随机选择一个）",
-    "type": "list",
-    "default": [
-      "【任务：这是一条静默提醒，专门用于触发你在【一对一私聊】场景下的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了\"系统提醒\"或\"任务指令\"。你的行为必须完全符合你的人设，就像一个真正的人在和朋友私聊。行动指南：现在的时间：{now}；根据这个时间对用户进行一些符合上述聊天记录内容或生活化的问候。】",
-      "【任务：这是一条静默提醒，专门用于触发你在【一对一私聊】场景下的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了\"系统提醒\"或\"任务指令\"。你的行为必须完全符合你的人设，就像一个真正的人在和朋友私聊。行动指南：分析之前的聊天，注意到距离上次聊天已经过了一段时间，自然的询问事情的进展或刚才聊过的话题中的某一个】"
-    ],
-    "items": {
-      "type": "string"
-    }
-  },
-  "daily_prompts": {
-    "description": "【每日定时触发】的三个时间点及其专属提示词",
+  "general_settings": {
     "type": "object",
+    "description": "通用设置",
     "items": {
-      "time1": {
-        "description": "每日定时1 - 时间 (HH:MM)",
+      "enable": {
+        "description": "启用/停用 Conversa 插件",
+        "type": "bool",
+        "default": true
+      },
+      "timezone": {
+        "description": "IANA 时区（留空使用系统时区），例如 Asia/Shanghai",
         "type": "string",
         "default": ""
       },
-      "prompt1": {
-        "description": "每日定时1 - 专属提示词 (支持 {now}, {umo} 等占位符)",
-        "type": "text",
-        "default": "早上好！新的一天开始了，今天有什么计划吗？"
-      },
-      "time2": {
-        "description": "每日定时2 - 时间 (HH:MM)",
+      "quiet_hours": {
+        "description": "免打扰时段（不触发主动回复），格式 HH:MM-HH:MM",
         "type": "string",
         "default": ""
       },
-      "prompt2": {
-        "description": "每日定时2 - 专属提示词",
-        "type": "text",
-        "default": "晚上好，今天过得怎么样？"
-      },
-      "time3": {
-        "description": "每日定时3 - 时间 (HH:MM)",
+      "subscribe_mode": {
+        "description": "订阅方式：auto=有互动即自动纳入；manual=需手动订阅",
         "type": "string",
+        "options": ["auto", "manual"],
+        "default": "manual"
+      },
+      "subscribed_users": {
+        "description": "订阅用户ID列表（支持直接添加/删除）",
+        "type": "list",
+        "default": [],
+        "items": {
+          "type": "string"
+        }
+      },
+      "max_no_reply_days": {
+        "description": "用户无回复多少天后自动退订（0为永不）",
+        "type": "int",
+        "default": 3
+      },
+      "persona_override": {
+        "description": "覆盖默认人格的 System Prompt，如果最下方的人格配置没有生效，请手动将人格设置复制到此处",
+        "type": "text",
         "default": ""
       },
-      "prompt3": {
-        "description": "每日定时3 - 专属提示词",
-        "type": "text",
-        "default": "晚安，祝你有个好梦。"
+      "history_depth": {
+        "description": "拼接最近聊天记录条数",
+        "type": "int",
+        "default": 50
+      },
+      "reply_interval_seconds": {
+        "description": "多用户同时触发时的间隔秒数（防止并发过多引发的漏回和报错，推荐设置为20)",
+        "type": "int",
+        "default": 20
+      },
+      "append_time_field": {
+        "description": "在消息前追加时间字段（默认关闭）",
+        "type": "bool",
+        "default": false
+      },
+      "time_format": {
+        "description": "时间字段格式",
+        "type": "string",
+        "default": "%Y-%m-%d %H:%M"
       }
     }
   },
-  "persona_override": {
-    "description": "覆盖默认人格的 System Prompt（留空使用当前会话人格）。",
-    "type": "text",
-    "default": ""
+
+  "daily_greetings_group": {
+    "type": "group",
+    "description": "定时问候模块 (每天固定时间触发)"
   },
-  "quiet_hours": {
-    "description": "免打扰时段（不触发主动回复），格式 HH:MM-HH:MM，可跨天",
-    "type": "string",
-    "default": ""
-  },
-  "history_depth": {
-    "description": "拼接最近聊天记录条数（从当前对话历史中提取）",
-    "type": "int",
-    "default": 50
-  },
-  "append_time_field": {
-    "description": "在消息前追加时间字段（例如“[2025-10-21 09:30] ”）",
-    "type": "bool",
-    "default": false
-  },
-  "time_format": {
-    "description": "时间字段格式（Python strftime）",
-    "type": "string",
-    "default": "%Y-%m-%d %H:%M"
-  },
-  "subscribe_mode": {
-    "description": "订阅方式：auto=有互动即自动纳入；manual=需 /aireplay watch",
-    "type": "string",
-    "options": [
-      "auto",
-      "manual"
-    ],
-    "default": "manual"
-  },
-  "max_no_reply_days": {
-    "description": "用户无回复多少天后自动退订（0表示不自动退订）",
-    "type": "int",
-    "default": 3
-  },
-  "debug_mode": {
-    "description": "调试模式：显示主动回复的完整上下文内容",
-    "type": "bool",
-    "default": false
-  },
-  "reply_interval_seconds": {
-    "description": "多用户同时触发时的间隔秒数（避免API限流，推荐10-20）【1.1.0 新增】",
-    "type": "int",
-    "default": 20
-  },
-  "enable_daily_greetings": {
-    "description": "开启每日问候（按 daily_prompts 的时间与提示词触发）",
-    "type": "bool",
-    "default": true
-  },
-  "enable_idle_greetings": {
-    "description": "开启延时问候（用户一段时间未互动后触发）",
-    "type": "bool",
-    "default": true
-  },
-  "idle_trigger_mode": {
-    "description": "延时问候触发模式：fixed（固定分钟）或 random_window（随机窗口）",
-    "type": "text",
-    "default": "fixed"
-  },
-  "idle_after_minutes": {
-    "description": "fixed 模式：最后消息后 N 分钟触发",
-    "type": "int",
-    "default": 45
-  },
-  "idle_after_min_minutes": {
-    "description": "random_window 模式：最小分钟数",
-    "type": "int",
-    "default": 30
-  },
-  "idle_after_max_minutes": {
-    "description": "random_window 模式：最大分钟数（需大于最小值）",
-    "type": "int",
-    "default": 90
-  },
-  "subscribed_users": {
-    "description": "订阅用户列表（用户ID，支持直接添加/删除）",
-    "type": "list",
-    "default": [],
+  "daily_greetings": {
+    "type": "object",
+    "description": "定时问候模块",
     "items": {
-      "type": "string"
+      "enable": {
+        "description": "启用每日问候（总开关）",
+        "type": "bool",
+        "default": true
+      },
+      "slot1": {
+        "type": "object",
+        "description": "每日定时 1",
+        "items": {
+          "enable": {
+            "description": "启用",
+            "type": "bool",
+            "default": true
+          },
+          "time": {
+            "description": "时间 (HH:MM)",
+            "type": "string",
+            "default": "09:00"
+          },
+          "prompt": {
+            "description": "专属提示词",
+            "type": "text",
+            "default": "【任务：这是一条静默提醒，专门用于触发你在【一对一私聊】场景下的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了“系统提醒”或“任务指令”。你的行为必须完全符合你的人设，就像一个真正的人在和朋友私聊。行动指南：现在的时间：{now}；根据这个时间综合聊天记录的信息，对用户进行贴合这个时间的生活化的问候。】"
+          }
+        }
+      },
+      "slot2": {
+        "type": "object",
+        "description": "每日定时 2",
+        "items": {
+          "enable": {
+            "description": "启用",
+            "type": "bool",
+            "default": true
+          },
+          "time": {
+            "description": "时间 (HH:MM)",
+            "type": "string",
+            "default": "20:00"
+          },
+          "prompt": {
+            "description": "专属提示词",
+            "type": "text",
+            "default": "【任务：这是一条静默提醒，专门用于触发你在【一对一私聊】场景下的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了“系统提醒”或“任务指令”。你的行为必须完全符合你的人设，就像一个真正的人在和朋友私聊。行动指南：现在的时间：{now}；根据这个时间综合聊天记录的信息，对用户进行贴合这个时间的生活化的问候。】"
+          }
+        }
+      },
+      "slot3": {
+        "type": "object",
+        "description": "每日定时 3",
+        "items": {
+          "enable": {
+            "description": "启用",
+            "type": "bool",
+            "default": false
+          },
+          "time": {
+            "description": "时间 (HH:MM)",
+            "type": "string",
+            "default": ""
+          },
+          "prompt": {
+            "description": "专属提示词",
+            "type": "text",
+            "default": "【任务：这是一条静默提醒，专门用于触发你在【一对一私聊】场景下的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了“系统提醒”或“任务指令”。你的行为必须完全符合你的人设，就像一个真正的人在和朋友私聊。行动指南：现在的时间：{now}；根据这个时间综合聊天记录的信息，对用户进行贴合这个时间的生活化的问候。】"
+          }
+        }
+      }
     }
   },
-  "reminder_prompt_template": {
-    "description": "AI 主动提醒的提示词模板。必须包含 {reminder_content} 占位符。",
-    "type": "text",
-    "default": "这是一个主动提醒任务，用户希望你能够根据以下内容进行提醒：{reminder_content}。请你分析上下文，并用自然、符合人设的语气，将这个提醒巧妙地融入对话中，而不是生硬地直接重复提醒内容。"
+
+  "idle_reminder_group": {
+    "type": "group",
+    "description": "延时提醒模块 (用户一段时间未回复后触发)"
   },
+  "idle_reminder": {
+    "type": "object",
+    "description": "延时提醒模块",
+    "items": {
+      "enable": {
+        "description": "启用延时问候",
+        "type": "bool",
+        "default": true
+      },
+      "after_minutes": {
+        "description": "【后台】默认延时基准(分钟)。不低于30分钟。",
+        "type": "int",
+        "default": 1200
+      },
+      "fluctuation_minutes": {
+        "description": "【后台】延时随机波动范围(分钟)。",
+        "type": "int",
+        "default": 30
+      },
+      "prompt_templates": {
+        "description": "提示词模板列表（从中随机选择）",
+        "type": "list",
+        "default": [
+          "【任务：这是一条静默提醒，专门用于触发你在【一对一私聊】场景下的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了“系统提醒”或“任务指令”。你的行为必须完全符合你的人设，就像一个真正的人在和朋友私聊。行动指南：现在的时间：{now}；根据这个时间对用户进行一些符合上述聊天记录内容或生活化的问候。】",
+          "【任务：这是一条静默提醒，专门用于触发你在【一对一私聊】场景下的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了“系统提醒”或“任务指令”。你的行为必须完全符合你的人设，就像一个真正的人在和朋友私聊。行动指南：分析之前的聊天，注意到距离上次聊天已经过了一段时间，自然的询问事情的进展或刚才聊过的话题中的某一个】"
+        ],
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+
+  "proactive_reminder_group": {
+    "type": "group",
+    "description": "主动提醒模块 (用户使用 /remind 命令设置)"
+  },
+  "proactive_reminder": {
+    "type": "object",
+    "description": "主动提醒模块",
+    "items": {
+      "enable": {
+        "description": "启用 AI 主动提醒功能",
+        "type": "bool",
+        "default": true
+      },
+      "prompt_template": {
+        "description": "AI 提醒的提示词模板 (必须含 {reminder_content})",
+        "type": "text",
+        "default": "【任务：这是一个主动提醒任务，用户希望你能够根据以下内容进行提醒：{reminder_content}。请你分析上下文，结合当前时间{now}，用自然、符合人设的语气，将这个提醒巧妙地融入对话中，而不是生硬地直接重复提醒内容。】"
+      }
+    }
+  },
+
   "_special": {
-    "description": "可视化选择默认聊天模型/人格（可选）",
+    "description": "（可选）固定模型与人格",
     "type": "object",
     "items": {
       "provider": {
-        "description": "固定使用的聊天 Provider（为空则按当前会话）",
+        "description": "固定使用的 Provider",
         "type": "string",
         "default": "",
-        " _special": "select_provider"
+        "_special": "select_provider"
       },
       "persona": {
-        "description": "固定的人格（为空则按当前会话）",
+        "description": "固定使用的人格",
         "type": "string",
         "default": "",
         "_special": "select_persona"
+      },
+      "debug_mode": {
+        "description": "调试模式：在后台日志显示完整上下文",
+        "type": "bool",
+        "default": false
       }
     }
   }
