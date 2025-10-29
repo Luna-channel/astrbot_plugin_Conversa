@@ -15,8 +15,6 @@ import astrbot.api.message_components as Comp
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
-from astrbot.const import PluginData, PluginHook, Switch, default_persona
-from astrbot.api.provider import ProviderRequest, LLMResponse
 
 # 工具函数
 def _ensure_dir(p: str) -> str:
