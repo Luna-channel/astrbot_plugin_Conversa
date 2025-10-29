@@ -40,7 +40,7 @@ Conversa 为 AstrBot 提供「**定时/间隔主动续聊**」「**随机提示�
 - **时间字段**
   - 可选在主动消息前追加 `[YYYY-MM-DD HH:MM]` 等时间标签（`append_time_field` + `time_format`）。
 - **定时提醒**
-  - 一次性/每日提醒：`/aireplay remind add ...`，到点直接向会话发送提示。
+  - 一次性/每日提醒：`/conversa remind add ...`，到点直接向会话发送提示。
 - **订阅模型**
   - 仅向**已订阅会话**发送主动消息。支持 `manual`（默认）与 `auto` 两种订阅方式。
   - **WebUI 可视化管理**：可在配置页面直接添加/删除订阅用户ID，无需使用命令。
@@ -100,8 +100,9 @@ AstrBot/
 | `daily.time2` | string | `""` | 每日触发时间 2（`HH:MM`）。若与 `time1` 相同会自动 **+1 分钟** 错峰。 |
 | `quiet_hours` | string | `""` | 免打扰时段（`HH:MM-HH:MM`），支持跨天。免打扰内不主动触发。 |
 | `history_depth` | int | `8` | 携带最近聊天条数（从当前会话历史提取）。 |
+| `idle_prompt_templates` | list | `[内置...` | **【v1.1 新增】**【间隔触发】的提示词模板列表（N分钟未回复时触发，从中随机选择）。 |
+| `daily_prompts` | object | `{...}` | **【v1.1 新增】**【每日定时触发】的三个时间点及其专属提示词。 |
 | `persona_override` | text | `""` | 覆盖默认人格的 System Prompt（留空使用当前会话人格）。 |
-| `custom_prompts` | list | `[内置提示词1, 内置提示词2]` | 自定义提示词列表，每次触发时随机选择一个。支持占位符：`{now}`、`{last_user}`、`{last_ai}`、`{umo}`。为空则让模型自然续聊。 |
 | `max_no_reply_days` | int | `7` | 用户无回复多少天后自动退订（0表示不自动退订）。 |
 | `debug_mode` | bool | `false` | 调试模式：显示主动回复的完整上下文内容。 |
 | `append_time_field` | bool | `false` | 在主动消息前追加时间字段。 |
@@ -109,12 +110,13 @@ AstrBot/
 | `subscribe_mode` | string(`manual`/`auto`) | `manual` | 订阅方式：`manual` 需要手动 `/conversa watch`；`auto` 有互动即自动纳入。 |
 | `reply_interval_seconds` | int | `20` | 多用户同时触发时的间隔秒数（避免API限流，推荐10-20）。 |
 | `subscribed_users` | list | `[]` | 订阅用户ID列表，支持在 WebUI 直接添加/删除。 |
+| `reminder_prompt_template` | text | `[见下文]` | **【v1.1 新增】** AI 主动提醒的提示词模板。必须包含 `{reminder_content}` 占位符。 |
 | `_special.provider` | string | `""` | （可选）固定使用的 Provider ID，留空按会话默认。 |
 | `_special.persona` | string | `""` | （可选）固定人格 ID，留空按会话默认。 |
 
 ### 内置提示词示例
 
-插件内置了两个优化的提示词模板：
+插件内置了两个优化的**间隔触发**提示词模板 (`idle_prompt_templates`)：
 
 **提示词1 - 时间导向型：**
 ```text
@@ -126,9 +128,13 @@ AstrBot/
 【任务：这是一条静默提醒，专门用于触发你在【一对一私聊】场景下的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了"系统提醒"或"任务指令"。你的行为必须完全符合你的人设，就像一个真正的人在和朋友私聊。行动指南：分析之前的聊天，注意到距离上次聊天已经过了一段时间，自然的询问事情的进展或刚才聊过的话题中的某一个】
 ```
 
+### 每日定时提示词
+`daily_prompts` 中的 `prompt1`, `prompt2`, `prompt3` 默认为简单的早安、晚安问候，你可以根据需要自定义。
+- 如果 `timeX` 或 `promptX` 未配置，则该时段不会触发。
+
 ### 自定义提示词占位符
 
-支持以下占位符：
+所有提示词模板都支持以下占位符：
 - `{now}` - 当前时间
 - `{last_user}` - 用户最后一条消息
 - `{last_ai}` - AI最后一条回复
@@ -142,56 +148,51 @@ AstrBot/
 
    **方式A：使用命令**（在会话中发送）
    ```
-   /conversa on
-   /conversa watch
+   /conversa on  (或 /cvs on)
+   /conversa watch (或 /cvs watch)
    ```
-
+   
    **方式B：在 WebUI 配置** ⭐ 推荐
    - 进入插件配置页面
    - 找到 `订阅用户列表` 字段
-   - 点击 `添加`，输入用户ID（如 `49025031`）
+   - 点击 `添加`，输入用户ID（如 `12345678`）
    - 点击 `保存`
 
-2. 设定触发方式（二选一或同时使用）：
+2. 设定触发方式（在 WebUI 或使用命令）：
 
-- **间隔触发**（最后消息后 30 分钟）  
-  ` /conversa set after 30 `
+- **间隔触发**：
+  - WebUI: 找到 `after_last_msg_minutes` 设置一个大于0的分钟数。
+  - 命令: ` /conversa set after 30 `
 
-- **每日触发**（每天 09:00 与 19:00）  
-  ```
-  /conversa set daily1 09:00
-  /conversa set daily2 19:00
-  ```
+- **每日触发**：
+  - WebUI: 找到 `daily_prompts`，设置 `time1`, `time2`, `time3` 的时间 (HH:MM)，并修改对应的提示词。
+  - 命令:
+    ```
+    /conversa set daily1 09:00
+    /conversa set daily2 13:00
+    /conversa set daily3 22:00
+    ```
 
 3. （可选）设置免打扰：  
-   ` /conversa set quiet 22:00-07:30 `
-
-4. （可选）管理提示词、历史深度：  
-   ```
-   /conversa prompt list                    # 查看当前提示词
-   /conversa prompt add 你的自定义提示词    # 添加新提示词
-   /conversa set history 8                  # 设置历史深度
-   ```
+   ` /conversa set quiet 23:00-07:00 `
+   
+4. （可选）管理提示词：
+   - **间隔触发**的提示词在 WebUI 的 `idle_prompt_templates` 中管理。
+   - **每日触发**的提示词在 WebUI 的 `daily_prompts` 中管理。
 
 ---
 
-## 💬 指令全集
+## 💬 指令全集 (`/conversa` 或 `/cvs`)
 
 - 基础
   - `/conversa on` / `/conversa off` — 启用/停用
-  - `/conversa watch` / `/conversa unwatch` — 订阅/退订当前会话（仅订阅会话会接收主动消息）
+  - `/conversa watch` / `/conversa unwatch` — 订阅/退订当前会话
   - `/conversa show` — 查看当前会话订阅状态与核心配置摘要
 - 触发设置
   - `/conversa set after <分钟>` — 设置“最后消息后 N 分钟触发”；设为 `0` 可关闭
-  - `/conversa set daily1 <HH:MM>` — 设置每日触发时间 1
-  - `/conversa set daily2 <HH:MM>` — 设置每日触发时间 2
+  - `/conversa set daily[1-3] <HH:MM>` — 设置每日触发时间 1/2/3
   - `/conversa set quiet <HH:MM-HH:MM>` — 设置免打扰时段（可跨天）
   - `/conversa set history <N>` — 设置携带最近聊天条数
-- 提示词管理
-  - `/conversa prompt list` — 查看当前提示词列表
-  - `/conversa prompt add <内容>` — 添加新提示词
-  - `/conversa prompt del <索引>` — 删除指定提示词
-  - `/conversa prompt clear` — 清空所有提示词
 - 提醒
   - `/conversa remind add <YYYY-MM-DD HH:MM> <内容>` — 新增**一次性**提醒
   - `/conversa remind add <HH:MM> <内容> daily` — 新增**每日**提醒
@@ -211,7 +212,7 @@ AstrBot/
      - 若距离最后消息已超过 `after_last_msg_minutes`，触发"间隔续聊"。
      - 若当前分钟命中 `daily.time1/time2`，触发"每日续聊"。
      - 利用"上次触发标签"去重（同一分钟不重复）。
-  4. 扫描**提醒**：到点发送一次性提醒；每日提醒按 HH:MM 命中即发。
+  4. 扫描**提醒**：到点后调用 **AI 生成提醒内容**并发送；每日提醒按 HH:MM 命中即发。
 - **智能退订**：用户超过 `max_no_reply_days` 天未回复时自动退订，用户主动回复时自动重新激活。
 - **随机提示词**：从 `custom_prompts` 列表中随机选择一个提示词模板。
 - **上下文拼接**：从 `ConversationManager` 取会话历史；若不可用则退化使用本插件的轻量历史缓存。
@@ -246,6 +247,8 @@ AstrBot/
 - **提醒未触发？**
   - 一次性提醒使用本地时间字符串对比（精确到分钟）；检查格式与分钟级命中。  
   - 每日提醒需在命中 `HH:MM` 时刻才触发。
+- **提醒内容不智能？**
+  - 在 WebUI 配置中，修改 `reminder_prompt_template` 提示词，引导 AI 更好地组织语言。
 
 ---
 

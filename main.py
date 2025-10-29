@@ -1,4 +1,3 @@
-﻿
 from __future__ import annotations
 
 import asyncio
@@ -57,13 +56,21 @@ def _fmt_now(fmt: str, tz: str | None) -> str:
 
 # 数据结构定义
 @dataclass
+class UserProfile:
+    """用户订阅信息和个性化设置"""
+    subscribed: bool = False  # 订阅状态
+    idle_after_minutes: int | None = None  # 自动续聊时间（分钟），None表示使用全局默认
+    daily_reminders_enabled: bool = True  # 是否开启每日提醒
+    daily_reminder_count: int = 3  # 每日提醒数量
+
+@dataclass
 class SessionState:
-    last_ts: float = 0.0
-    history: Deque[Dict] = field(default_factory=lambda: deque(maxlen=32))
-    subscribed: bool = False
-    last_fired_tag: str = ""
+    """运行时会话状态（内存中维护）"""
+    last_ts: float = 0.0  # 最后活跃时间戳
+    last_fired_tag: str = ""  # 最后触发标签
     last_user_reply_ts: float = 0.0  # 用户最后回复时间戳
     consecutive_no_reply_count: int = 0  # 连续无回复次数
+    next_idle_ts: float = 0.0  # 下一次延时问候触发时间戳（0表示未计划）
 
 @dataclass
 class Reminder:
@@ -80,79 +87,103 @@ class Conversa(Star):
         super().__init__(context)
         self.cfg: AstrBotConfig = config
         self._loop_task: Optional[asyncio.Task] = None
-        self._states: Dict[str, SessionState] = {}
-        self._reminders: Dict[str, Reminder] = {}
+        self._states: Dict[str, SessionState] = {}  # 运行时会话状态
+        self._user_profiles: Dict[str, UserProfile] = {}  # 用户订阅信息和设置
+        self._context_caches: Dict[str, Deque[Dict]] = {}  # 聊天上下文缓存
+        self._reminders: Dict[str, Reminder] = {}  # 用户设置的提醒
 
         root = os.getcwd()
         self._data_dir = _ensure_dir(os.path.join(root, "data", "plugin_data", "astrbot_plugin_conversa"))
-        self._state_path = os.path.join(self._data_dir, "state.json")
-        self._remind_path = os.path.join(self._data_dir, "reminders.json")
-        self._load_states()
+        self._state_path = os.path.join(self._data_dir, "state.json")  # 运行时状态（兼容旧版）
+        self._user_profiles_path = os.path.join(self._data_dir, "user_profiles.json")  # 用户订阅信息
+        self._context_cache_path = os.path.join(self._data_dir, "context_cache.json")  # 聊天缓存
+        self._remind_path = os.path.join(self._data_dir, "reminders.json")  # 用户提醒
+        self._session_states_path = os.path.join(self._data_dir, "session_states.json") # 运行时状态
+        self._load_user_profiles()
+        self._load_context_caches()
         self._load_reminders()
+        self._load_session_states()
         self._sync_subscribed_users_from_config()  # 从配置同步订阅列表到内部状态
 
         self._loop_task = asyncio.create_task(self._scheduler_loop())
         logger.info("[Conversa] scheduler started.")
 
     # 数据持久化
-    def _load_states(self):
-        """从磁盘加载所有会话状态（订阅状态、历史记录、时间戳等）"""
-        if os.path.exists(self._state_path):
+    def _load_user_profiles(self):
+        """加载用户订阅信息和个性化设置"""
+        if os.path.exists(self._user_profiles_path):
             try:
-                with open(self._state_path, "r", encoding="utf-8") as f:
+                with open(self._user_profiles_path, "r", encoding="utf-8") as f:
                     d = json.load(f)
-                for umo, st in d.get("states", {}).items():
-                    # 恢复历史记录
-                    history = deque(maxlen=32)
-                    if "history" in st:
-                        for h in st["history"]:
-                            history.append(h)
-                    
-                    s = SessionState(
-                        last_ts=st.get("last_ts", 0.0),
-                        history=history,
-                        subscribed=st.get("subscribed", False),
-                        last_fired_tag=st.get("last_fired_tag", ""),
-                        last_user_reply_ts=st.get("last_user_reply_ts", 0.0),
-                        consecutive_no_reply_count=st.get("consecutive_no_reply_count", 0),
+                for umo, profile_data in d.get("profiles", {}).items():
+                    profile = UserProfile(
+                        subscribed=profile_data.get("subscribed", False),
+                        idle_after_minutes=profile_data.get("idle_after_minutes"),
+                        daily_reminders_enabled=profile_data.get("daily_reminders_enabled", True),
+                        daily_reminder_count=profile_data.get("daily_reminder_count", 3)
                     )
-                    self._states[umo] = s
+                    self._user_profiles[umo] = profile
             except Exception as e:
-                logger.error(f"[Conversa] load states error: {e}")
+                logger.error(f"[Conversa] load user profiles error: {e}")
 
-    def _save_states(self):
-        """保存所有会话状态到磁盘，并同步订阅用户列表到配置"""
+    def _save_user_profiles(self):
+        """保存用户订阅信息和个性化设置"""
         try:
             dump = {
-                "states": {
-                    k: {
-                        "last_ts": v.last_ts,
-                        "history": list(v.history),  # 保存历史记录
-                        "subscribed": v.subscribed,
-                        "last_fired_tag": v.last_fired_tag,
-                        "last_user_reply_ts": v.last_user_reply_ts,
-                        "consecutive_no_reply_count": v.consecutive_no_reply_count
-                    } for k, v in self._states.items()
+                "profiles": {
+                    umo: {
+                        "subscribed": profile.subscribed,
+                        "idle_after_minutes": profile.idle_after_minutes,
+                        "daily_reminders_enabled": profile.daily_reminders_enabled,
+                        "daily_reminder_count": profile.daily_reminder_count
+                    } for umo, profile in self._user_profiles.items()
                 }
             }
-            with open(self._state_path, "w", encoding="utf-8") as f:
+            with open(self._user_profiles_path, "w", encoding="utf-8") as f:
                 json.dump(dump, f, ensure_ascii=False, indent=2)
             
             # 同步订阅用户列表到配置（以用户ID形式存储，方便WebUI管理）
             subscribed_ids = []
-            for umo, st in self._states.items():
-                if st.subscribed:
+            for umo, profile in self._user_profiles.items():
+                if profile.subscribed:
                     # 提取用户ID（去掉平台前缀）
                     user_id = umo.split(":")[-1] if ":" in umo else umo
                     subscribed_ids.append(user_id)
             
-            logger.debug(f"[Conversa] _save_states: 同步 {len(subscribed_ids)} 个订阅用户到配置: {subscribed_ids}")
+            logger.debug(f"[Conversa] _save_user_profiles: 同步 {len(subscribed_ids)} 个订阅用户到配置: {subscribed_ids}")
             self.cfg["subscribed_users"] = subscribed_ids
             self.cfg.save_config()
-            logger.debug(f"[Conversa] _save_states: 配置已保存")
-            
+            logger.debug(f"[Conversa] _save_user_profiles: 配置已保存")
+
         except Exception as e:
-            logger.error(f"[Conversa] save states error: {e}")
+            logger.error(f"[Conversa] save user profiles error: {e}")
+
+    def _load_context_caches(self):
+        """加载聊天上下文缓存"""
+        if os.path.exists(self._context_cache_path):
+            try:
+                with open(self._context_cache_path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                for umo, cache_data in d.get("caches", {}).items():
+                    context_cache = deque(maxlen=32)
+                    for item in cache_data:
+                        context_cache.append(item)
+                    self._context_caches[umo] = context_cache
+            except Exception as e:
+                logger.error(f"[Conversa] load context caches error: {e}")
+
+    def _save_context_caches(self):
+        """保存聊天上下文缓存"""
+        try:
+            dump = {
+                "caches": {
+                    umo: list(cache) for umo, cache in self._context_caches.items()
+                }
+            }
+            with open(self._context_cache_path, "w", encoding="utf-8") as f:
+                json.dump(dump, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"[Conversa] save context caches error: {e}")
 
     def _load_reminders(self):
         """从磁盘加载所有提醒事项（一次性提醒和每日提醒）"""
@@ -175,6 +206,28 @@ class Conversa(Star):
         except Exception as e:
             logger.error(f"[Conversa] save reminders error: {e}")
     
+    def _load_session_states(self):
+        """加载运行时会话状态"""
+        if os.path.exists(self._session_states_path):
+            try:
+                with open(self._session_states_path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                for umo, st_data in d.items():
+                    self._states[umo] = SessionState(**st_data)
+            except Exception as e:
+                logger.error(f"[Conversa] load session states error: {e}")
+
+    def _save_session_states(self):
+        """保存运行时会话状态"""
+        try:
+            dump = {
+                umo: state.__dict__ for umo, state in self._states.items()
+            }
+            with open(self._session_states_path, "w", encoding="utf-8") as f:
+                json.dump(dump, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"[Conversa] save session states error: {e}")
+    
     def _sync_subscribed_users_from_config(self):
         """
         从配置文件同步订阅用户列表到内部状态
@@ -195,21 +248,21 @@ class Conversa(Star):
                 logger.warning(f"[Conversa] subscribed_users 配置格式错误，应为列表")
                 return
             
-            # 将配置中的用户ID应用到内部状态
-            for umo, st in self._states.items():
+            # 将配置中的用户ID应用到用户配置
+            for umo, profile in self._user_profiles.items():
                 user_id = umo.split(":")[-1] if ":" in umo else umo
                 if user_id in config_subscribed_ids:
-                    st.subscribed = True
+                    profile.subscribed = True
                     logger.debug(f"[Conversa] 从配置同步订阅状态: {umo}")
-            
-            # 为配置中但尚未存在于 _states 的用户创建状态（标记为已订阅）
+
+            # 为配置中但尚未存在于 _user_profiles 的用户创建配置（标记为已订阅）
             # 注意：这些用户的完整 umo 要等到他们第一次发消息时才能确定
             # 所以这里只是做个标记，实际订阅会在 _on_any_message 中生效
             
             logger.info(f"[Conversa] 已从配置同步 {len(config_subscribed_ids)} 个订阅用户ID: {config_subscribed_ids}")
             
             # 显示当前所有已订阅的会话
-            subscribed_sessions = [umo for umo, st in self._states.items() if st.subscribed]
+            subscribed_sessions = [umo for umo, profile in self._user_profiles.items() if profile.subscribed]
             logger.info(f"[Conversa] 当前已订阅的会话数: {len(subscribed_sessions)}")
             
         except Exception as e:
@@ -233,7 +286,15 @@ class Conversa(Star):
         umo = event.unified_msg_origin
         if umo not in self._states:
             self._states[umo] = SessionState()
+        if umo not in self._user_profiles:
+            self._user_profiles[umo] = UserProfile()
+        if umo not in self._context_caches:
+            self._context_caches[umo] = deque(maxlen=32)
+
         st = self._states[umo]
+        profile = self._user_profiles[umo]
+        context_cache = self._context_caches[umo]
+
         now_ts = _now_tz(self.cfg.get("timezone") or None).timestamp()
         st.last_ts = now_ts
         st.last_user_reply_ts = now_ts  # 记录用户最后回复时间
@@ -241,20 +302,44 @@ class Conversa(Star):
 
         # 检查订阅状态：支持自动订阅模式
         if (self.cfg.get("subscribe_mode") or "manual") == "auto":
-            st.subscribed = True
+            profile.subscribed = True
 
+        # 只为订阅用户记录上下文缓存（双向对话）
         try:
-            role = "user"
-            content = event.message_str or ""
-            if content:
-                st.history.append({"role": role, "content": content})
+            if profile.subscribed:
+                role = "assistant" if event.is_self else "user"
+                content = event.message_str or ""
+                if content:
+                    context_cache.append({"role": role, "content": content})
         except Exception:
             pass
 
-        self._save_states()
+        # 计算下一次延时问候触发时间（优先使用用户个性化设置）
+        try:
+            if profile.subscribed and bool(self.cfg.get("enable_idle_greetings", True)):
+                delay_m = profile.idle_after_minutes  # 优先使用用户设置
+                
+                # 如果用户未设置，则使用全局设置
+                if delay_m is None:
+                    mode = (self.cfg.get("idle_trigger_mode") or "fixed").strip().lower()
+                    if mode == "random_window":
+                        min_m = int(self.cfg.get("idle_after_min_minutes") or 30)
+                        max_m = int(self.cfg.get("idle_after_max_minutes") or 90)
+                        delay_m = random.randint(min_m, max_m) if max_m > min_m else min_m
+                    else:  # fixed mode
+                        delay_m = int(self.cfg.get("idle_after_minutes") or 45)
+                
+                st.next_idle_ts = now_ts + delay_m * 60
+        except Exception as e:
+            logger.warning(f"[Conversa] 计算 next_idle_ts 失败: {e}")
+
+
+        self._save_session_states()
+        self._save_user_profiles()
+        self._save_context_caches()
 
     # QQ命令处理
-    @filter.command("conversa")
+    @filter.command("conversa", aliases=["cvs"])
     async def _cmd_conversa(self, event: AstrMessageEvent):
         """
         Conversa 插件的命令处理器
@@ -284,7 +369,7 @@ class Conversa(Star):
         def reply(msg: str):
             return event.plain_result(msg)
 
-        if "help" in lower or text.strip() == "/conversa":
+        if "help" in lower or text.strip() == "/conversa" or text.strip() == "/cvs":
             yield reply(self._help_text())
             return
 
@@ -297,7 +382,7 @@ class Conversa(Star):
             umo = event.unified_msg_origin
             if umo not in self._states:
                 self._states[umo] = SessionState()
-            debug_info.append(f"用户订阅状态: {self._states[umo].subscribed}")
+            debug_info.append(f"用户订阅状态: {self._user_profiles.get(umo).subscribed if self._user_profiles.get(umo) else False}")
             debug_info.append(f"间隔触发设置: {self.cfg.get('after_last_msg_minutes', 0)}分钟")
             debug_info.append(f"免打扰时间: {self.cfg.get('quiet_hours', '')}")
             debug_info.append(f"最大无回复天数: {self.cfg.get('max_no_reply_days', 0)}")
@@ -317,34 +402,53 @@ class Conversa(Star):
 
         if " watch" in lower:
             umo = event.unified_msg_origin
-            if umo not in self._states:
-                self._states[umo] = SessionState()
-            self._states[umo].subscribed = True
+            if umo not in self._user_profiles:
+                self._user_profiles[umo] = UserProfile()
+            self._user_profiles[umo].subscribed = True
             logger.info(f"[Conversa] 用户执行 watch 命令: {umo}")
-            self._save_states()
+            self._save_user_profiles()
             yield reply(f"📌 已订阅当前会话")
             return
 
         if " unwatch" in lower:
             umo = event.unified_msg_origin
-            if umo not in self._states:
-                self._states[umo] = SessionState()
-            self._states[umo].subscribed = False
-            self._save_states()
+            if umo not in self._user_profiles:
+                self._user_profiles[umo] = UserProfile()
+            self._user_profiles[umo].subscribed = False
+            self._save_user_profiles()
             yield reply(f"📭 已退订当前会话")
             return
 
         if " show" in lower:
             umo = event.unified_msg_origin
+            profile = self._user_profiles.get(umo)
             st = self._states.get(umo)
+            # 计算 next_idle_ts 友好显示
+            tz = self.cfg.get("timezone") or None
+            next_idle_str = "未计划"
+            if st and st.next_idle_ts and st.next_idle_ts > 0:
+                try:
+                    dt = datetime.fromtimestamp(st.next_idle_ts, tz=_now_tz(tz).tzinfo)
+                    next_idle_str = dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    next_idle_str = str(st.next_idle_ts)
             info = {
                 "enable": self.cfg.get("enable"),
                 "timezone": self.cfg.get("timezone"),
-                "after_last_msg_minutes": self.cfg.get("after_last_msg_minutes"),
-                "daily": self.cfg.get("daily"),
+                "enable_daily_greetings": self.cfg.get("enable_daily_greetings", True),
+                "enable_idle_greetings": self.cfg.get("enable_idle_greetings", True),
+                "idle_trigger_mode": self.cfg.get("idle_trigger_mode", "fixed"),
+                "idle_after_minutes": self.cfg.get("idle_after_minutes"),
+                "idle_after_min_minutes": self.cfg.get("idle_after_min_minutes"),
+                "idle_after_max_minutes": self.cfg.get("idle_after_max_minutes"),
+                "next_idle_at": next_idle_str,
+                "daily": self.cfg.get("daily_prompts"),
                 "quiet_hours": self.cfg.get("quiet_hours"),
                 "history_depth": self.cfg.get("history_depth"),
-                "subscribed": bool(st and st.subscribed),
+                "subscribed": bool(profile and profile.subscribed),
+                "user_idle_after_minutes": profile.idle_after_minutes if profile else None,
+                "user_daily_reminders_enabled": profile.daily_reminders_enabled if profile else True,
+                "user_daily_reminder_count": profile.daily_reminder_count if profile else 3,
             }
             yield reply("当前配置/状态：\n" + json.dumps(info, ensure_ascii=False, indent=2))
             return
@@ -356,22 +460,15 @@ class Conversa(Star):
             yield reply(f"⏱️ 已设置 last_msg 后触发：{m.group(1)} 分钟")
             return
 
-        m = re.search(r"set\s+daily1\s+(\d{1,2}:\d{2})", lower)
+        m = re.search(r"set\s+daily([1-3])\s+(\d{1,2}:\d{2})", lower)
         if m:
-            d = self.cfg.get("daily") or {}
-            d["time1"] = m.group(1)
-            self.cfg["daily"] = d
+            n = m.group(1)
+            t = m.group(2)
+            d = self.cfg.get("daily_prompts") or {}
+            d[f"time{n}"] = t
+            self.cfg["daily_prompts"] = d
             self.cfg.save_config()
-            yield reply(f"🗓️ 已设置 daily1：{m.group(1)}")
-            return
-
-        m = re.search(r"set\s+daily2\s+(\d{1,2}:\d{2})", lower)
-        if m:
-            d = self.cfg.get("daily") or {}
-            d["time2"] = m.group(1)
-            self.cfg["daily"] = d
-            self.cfg.save_config()
-            yield reply(f"🗓️ 已设置 daily2：{m.group(1)}")
+            yield reply(f"🗓️ 已设置 daily{n}：{t}")
             return
 
         m = re.search(r"set\s+quiet\s+(\d{1,2}:\d{2})-(\d{1,2}:\d{2})", lower)
@@ -388,52 +485,9 @@ class Conversa(Star):
             yield reply(f"🧵 已设置历史条数：{mp.group(1)}")
             return
 
-        # 处理多提示词管理命令
+        # 移除了 prompt 管理命令，因为现在通过 WebUI 配置
         if " prompt " in lower:
-            parts = text.split()
-            if len(parts) >= 3 and parts[1].lower() == "prompt":
-                sub = parts[2].lower()
-                if sub == "list":
-                    prompts = self.cfg.get("custom_prompts") or []
-                    if not prompts:
-                        yield reply("📝 暂无自定义提示词")
-                    else:
-                        result = "📝 当前提示词列表：\n"
-                        for i, prompt in enumerate(prompts, 1):
-                            result += f"{i}. {prompt[:50]}{'...' if len(prompt) > 50 else ''}\n"
-                        yield reply(result)
-                    return
-                elif sub == "add" and len(parts) >= 4:
-                    new_prompt = text.split("add", 1)[1].strip()
-                    if new_prompt:
-                        prompts = self.cfg.get("custom_prompts") or []
-                        prompts.append(new_prompt)
-                        self.cfg["custom_prompts"] = prompts
-                        self.cfg.save_config()
-                        yield reply(f"✏️ 已添加提示词（共{len(prompts)}个）")
-                    else:
-                        yield reply("❌ 提示词内容不能为空")
-                    return
-                elif sub == "del" and len(parts) >= 4:
-                    try:
-                        index = int(parts[3]) - 1
-                        prompts = self.cfg.get("custom_prompts") or []
-                        if 0 <= index < len(prompts):
-                            del prompts[index]
-                            self.cfg["custom_prompts"] = prompts
-                            self.cfg.save_config()
-                            yield reply(f"🗑️ 已删除提示词（剩余{len(prompts)}个）")
-                        else:
-                            yield reply("❌ 提示词索引超出范围")
-                    except ValueError:
-                        yield reply("❌ 请输入有效的数字索引")
-                    return
-                elif sub == "clear":
-                    self.cfg["custom_prompts"] = []
-                    self.cfg.save_config()
-                    yield reply("🗑️ 已清空所有提示词")
-                    return
-            yield reply("用法：/conversa prompt list|add <内容>|del <索引>|clear")
+            yield reply("📝 提示词管理功能已移至 WebUI 配置页面，请在那里设置“间隔触发”和“每日定时”的专属提示词。")
             return
 
         if " remind " in lower or lower.endswith(" remind"):
@@ -482,17 +536,17 @@ class Conversa(Star):
     def _help_text(self) -> str:
         """返回插件的帮助文本，展示所有可用命令"""
         return (
-            "Conversa 帮助：\n"
+            "Conversa 帮助 (指令: /conversa 或 /cvs)：\n"
             "/conversa on|off - 启用/停用插件\n"
             "/conversa watch - 订阅当前会话\n"
             "/conversa unwatch - 退订当前会话\n"
             "/conversa show - 显示当前配置\n"
             "/conversa debug - 显示调试信息\n"
             "/conversa set after <分钟> - 设置间隔触发\n"
-            "/conversa set daily1/daily2 <HH:MM> - 设置定时触发\n"
+            "/conversa set daily[1-3] <HH:MM> - 设置三个每日定时触发时间\n"
             "/conversa set quiet <HH:MM-HH:MM> - 设置免打扰\n"
             "/conversa set history <N> - 设置历史条数\n"
-            "/conversa prompt list|add|del|clear - 管理提示词\n"
+            "（提示词管理已移至WebUI）\n"
             "/conversa remind add/list/del - 管理提醒\n"
         )
 
@@ -595,13 +649,14 @@ class Conversa(Star):
         
         # 策略3：使用插件的轻量历史缓存（最后的降级方案）
         try:
-            st = self._states.get(umo)
-            if st and st.history:
-                contexts = list(st.history)
-                logger.debug(f"[Conversa] 使用插件缓存历史，共{len(contexts)}条")
+            profile = self._user_profiles.get(umo)
+            context_cache = self._context_caches.get(umo)
+            if profile and profile.subscribed and context_cache:
+                contexts = list(context_cache)
+                logger.debug(f"[Conversa] 使用插件上下文缓存，共{len(contexts)}条")
                 return contexts
         except Exception as e:
-            logger.warning(f"[Conversa] 从插件缓存获取历史失败: {e}")
+            logger.warning(f"[Conversa] 从插件上下文缓存获取失败: {e}")
         
         logger.warning(f"[Conversa] ⚠️ 无法获取 {umo} 的对话历史，将使用空上下文")
         return contexts
@@ -676,20 +731,25 @@ class Conversa(Star):
         quiet = self.cfg.get("quiet_hours", "") or ""
         hist_n = int(self.cfg.get("history_depth") or 8)
 
-        daily = self.cfg.get("daily") or {}
+        daily = self.cfg.get("daily_prompts") or {}
         t1 = _parse_hhmm(str(daily.get("time1", "") or ""))
         t2 = _parse_hhmm(str(daily.get("time2", "") or ""))
-        if t1 and t2 and t1 == t2:
-            h, m = t2; m = (m + 1) % 60; h = (h + (1 if m == 0 else 0)) % 24; t2 = (h, m)
+        t3 = _parse_hhmm(str(daily.get("time3", "") or ""))
+
+        # 确保时间点唯一，避免重复触发
+        times = {t for t in (t1, t2, t3) if t}
+        unique_times = sorted(list(times))
+        t1, t2, t3 = (unique_times + [None, None, None])[:3]
 
         curr_min_tag_1 = f"daily1@{now.strftime('%Y-%m-%d')} {t1[0]:02d}:{t1[1]:02d}" if t1 else ""
         curr_min_tag_2 = f"daily2@{now.strftime('%Y-%m-%d')} {t2[0]:02d}:{t2[1]:02d}" if t2 else ""
+        curr_min_tag_3 = f"daily3@{now.strftime('%Y-%m-%d')} {t3[0]:02d}:{t3[1]:02d}" if t3 else ""
 
-        subscribed_count = sum(1 for st in self._states.values() if st.subscribed)
+        subscribed_count = sum(1 for profile in self._user_profiles.values() if profile.subscribed)
         logger.debug(f"[Conversa] Tick: 当前时间={now.strftime('%Y-%m-%d %H:%M')}, 订阅用户数={subscribed_count}, 免打扰={quiet}")
-        
-        for umo, st in list(self._states.items()):
-            if not st.subscribed:
+
+        for umo, profile in list(self._user_profiles.items()):
+            if not profile.subscribed:
                 continue
             
             if _in_quiet(now, quiet):
@@ -697,73 +757,98 @@ class Conversa(Star):
                 continue
 
             # 检查是否需要自动退订
-            if await self._should_auto_unsubscribe(umo, st, now):
+            st = self._states.get(umo)  # 获取运行时状态用于检查
+            if st and await self._should_auto_unsubscribe(umo, profile, st, now):
                 logger.debug(f"[Conversa] Tick: {umo} 被自动退订")
                 continue
             
             logger.debug(f"[Conversa] Tick: 检查 {umo}, last_ts={st.last_ts}, last_fired_tag={st.last_fired_tag}")
 
-            idle_min = int(self.cfg.get("after_last_msg_minutes") or 0)
-            if idle_min > 0 and st.last_ts > 0:
-                last = datetime.fromtimestamp(st.last_ts, tz=now.tzinfo)
-                diff_min = (now - last).total_seconds() / 60
-                logger.debug(f"[Conversa] Tick: {umo} 间隔检查 - 配置={idle_min}分钟, 实际={diff_min:.1f}分钟")
-                if now - last >= timedelta(minutes=idle_min):
+            # 延时问候（基于 next_idle_ts 和用户个性化设置）
+            if bool(self.cfg.get("enable_idle_greetings", True)):
+                st = self._states.get(umo)  # 获取运行时状态
+                if st and st.next_idle_ts and now.timestamp() >= st.next_idle_ts:
                     tag = f"idle@{now.strftime('%Y-%m-%d %H:%M')}"
                     if st.last_fired_tag != tag:
-                        logger.info(f"[Conversa] Tick: 触发间隔回复 {umo}")
-                        ok = await self._proactive_reply(umo, hist_n, tz)
-                        if ok:
-                            st.last_fired_tag = tag
-                        else:
-                            st.consecutive_no_reply_count += 1
+                        idle_prompts = self.cfg.get("idle_prompt_templates") or []
+                        if idle_prompts:
+                            prompt_template = random.choice(idle_prompts)
+                            logger.info(f"[Conversa] Tick: 触发延时问候 {umo}")
+                            ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
+                            if ok:
+                                st.last_fired_tag = tag
+                                # 触发后清零 next_idle_ts，等待用户下次消息重置
+                                st.next_idle_ts = 0.0
+                            else:
+                                st.consecutive_no_reply_count += 1
                     else:
                         logger.debug(f"[Conversa] Tick: {umo} 已触发过 {tag}")
-            elif idle_min > 0:
-                logger.debug(f"[Conversa] Tick: {umo} last_ts=0，跳过间隔检查")
 
-            if t1:
-                logger.debug(f"[Conversa] Tick: {umo} 每日定时1检查 - 配置={t1[0]:02d}:{t1[1]:02d}, 当前={now.hour:02d}:{now.minute:02d}")
-                if now.hour == t1[0] and now.minute == t1[1]:
+            # 每日定时1
+            if bool(self.cfg.get("enable_daily_greetings", True)) and profile.daily_reminders_enabled:
+                st = self._states.get(umo)  # 获取运行时状态
+                if st and t1 and now.hour == t1[0] and now.minute == t1[1]:
                     if st.last_fired_tag != curr_min_tag_1:
-                        logger.info(f"[Conversa] Tick: 触发每日定时1回复 {umo}")
-                        ok = await self._proactive_reply(umo, hist_n, tz)
-                        if ok:
-                            st.last_fired_tag = curr_min_tag_1
-                        else:
-                            st.consecutive_no_reply_count += 1
+                        prompt_template = daily.get("prompt1")
+                        if prompt_template:
+                            logger.info(f"[Conversa] Tick: 触发每日定时1回复 {umo}")
+                            ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
+                            if ok:
+                                st.last_fired_tag = curr_min_tag_1
+                            else:
+                                st.consecutive_no_reply_count += 1
                     else:
                         logger.debug(f"[Conversa] Tick: {umo} 已触发过 {curr_min_tag_1}")
                         
-            if t2:
-                logger.debug(f"[Conversa] Tick: {umo} 每日定时2检查 - 配置={t2[0]:02d}:{t2[1]:02d}, 当前={now.hour:02d}:{now.minute:02d}")
-                if now.hour == t2[0] and now.minute == t2[1]:
+            # 每日定时2
+            if bool(self.cfg.get("enable_daily_greetings", True)) and profile.daily_reminders_enabled:
+                st = self._states.get(umo)  # 获取运行时状态
+                if st and t2 and now.hour == t2[0] and now.minute == t2[1]:
                     if st.last_fired_tag != curr_min_tag_2:
-                        logger.info(f"[Conversa] Tick: 触发每日定时2回复 {umo}")
-                        ok = await self._proactive_reply(umo, hist_n, tz)
-                        if ok:
-                            st.last_fired_tag = curr_min_tag_2
-                        else:
-                            st.consecutive_no_reply_count += 1
+                        prompt_template = daily.get("prompt2")
+                        if prompt_template:
+                            logger.info(f"[Conversa] Tick: 触发每日定时2回复 {umo}")
+                            ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
+                            if ok:
+                                st.last_fired_tag = curr_min_tag_2
+                            else:
+                                st.consecutive_no_reply_count += 1
                     else:
                         logger.debug(f"[Conversa] Tick: {umo} 已触发过 {curr_min_tag_2}")
 
-        await self._check_reminders(now, tz)
-        self._save_states()
+            # 每日定时3
+            if bool(self.cfg.get("enable_daily_greetings", True)) and profile.daily_reminders_enabled:
+                st = self._states.get(umo)  # 获取运行时状态
+                if st and t3 and now.hour == t3[0] and now.minute == t3[1]:
+                    if st.last_fired_tag != curr_min_tag_3:
+                        prompt_template = daily.get("prompt3")
+                        if prompt_template:
+                            logger.info(f"[Conversa] Tick: 触发每日定时3回复 {umo}")
+                            ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
+                            if ok:
+                                st.last_fired_tag = curr_min_tag_3
+                            else:
+                                st.consecutive_no_reply_count += 1
+                    else:
+                        logger.debug(f"[Conversa] Tick: {umo} 已触发过 {curr_min_tag_3}")
 
-    async def _should_auto_unsubscribe(self, umo: str, st: SessionState, now: datetime) -> bool:
+        await self._check_reminders(now, tz)
+        self._save_session_states()
+
+    async def _should_auto_unsubscribe(self, umo: str, profile: UserProfile, st: SessionState, now: datetime) -> bool:
         """
         检查是否需要自动退订（根据用户无回复天数）
-        
+
         参数：
             umo: 统一消息来源（用户标识）
+            profile: 该用户的订阅信息
             st: 该用户的会话状态
             now: 当前时间
-            
+
         返回：
             True: 已自动退订该用户
             False: 不需要退订
-            
+
         逻辑：
         - 如果配置了 max_no_reply_days > 0
         - 且用户最后回复时间距今超过设定天数
@@ -773,18 +858,150 @@ class Conversa(Star):
         max_days = int(self.cfg.get("max_no_reply_days") or 0)
         if max_days <= 0:
             return False
-        
+
         if st.last_user_reply_ts > 0:
             last_reply = datetime.fromtimestamp(st.last_user_reply_ts, tz=now.tzinfo)
             days_since_reply = (now - last_reply).days
-            
+
             if days_since_reply >= max_days:
-                st.subscribed = False
+                profile.subscribed = False
                 logger.info(f"[Conversa] 自动退订 {umo}：用户{days_since_reply}天未回复")
+                self._save_user_profiles()
                 return True
-        
+
         return False
 
+
+    async def _proactive_reminder_reply(self, umo: str, reminder_content: str) -> bool:
+        """
+        执行由 AI 生成的主动提醒回复
+        
+        参数:
+            umo: 统一消息来源（会话标识）
+            reminder_content: 提醒的核心内容
+            
+        返回:
+            True: 成功发送提醒
+            False: 发送失败或回复为空
+        """
+        try:
+            hist_n = int(self.cfg.get("history_depth") or 8)
+            
+            # 1. 获取 Provider 和 Conversation (与 _proactive_reply 逻辑类似)
+            fixed_provider = (self.cfg.get("_special") or {}).get("provider") or ""
+            provider = self.context.get_provider_by_id(fixed_provider) if fixed_provider else self.context.get_using_provider(umo=umo)
+            if not provider:
+                logger.warning(f"[Conversa] reminder provider missing for {umo}")
+                return False
+
+            conv_mgr = self.context.conversation_manager
+            curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+            conversation = await conv_mgr.get_conversation(umo, curr_cid)
+
+            # 2. 获取 System Prompt (复用 _proactive_reply 中的逻辑)
+            # (为简化，这里直接调用 _proactive_reply 的部分逻辑，未来可重构为公共函数)
+            system_prompt = await self._get_system_prompt(umo, conversation)
+
+            # 3. 获取上下文
+            contexts = await self._safe_get_full_contexts(umo, conversation)
+            if contexts and hist_n > 0:
+                contexts = contexts[-hist_n:]
+
+            # 4. 构造提醒专用的 Prompt
+            prompt_template = self.cfg.get("reminder_prompt_template") or "用户提醒：{reminder_content}"
+            prompt = prompt_template.format(reminder_content=reminder_content)
+
+            logger.info(f"[Conversa] 触发 AI 提醒 for {umo}: {reminder_content}")
+
+            # 5. 调用 LLM
+            llm_resp = await provider.text_chat(
+                prompt=prompt,
+                contexts=contexts,
+                system_prompt=system_prompt or ""
+            )
+            text = llm_resp.completion_text if hasattr(llm_resp, "completion_text") else ""
+
+            if not text.strip():
+                return False
+
+            # 6. 发送消息
+            await self._send_text(umo, f"⏰ {text}") # 在AI提醒前加上图标
+            logger.info(f"[Conversa] 已发送 AI 提醒给 {umo}: {text[:50]}...")
+            return True
+
+        except Exception as e:
+            logger.error(f"[Conversa] proactive reminder error({umo}): {e}")
+            return False
+
+    async def _get_system_prompt(self, umo: str, conversation) -> str:
+        """
+        一个辅助函数，用于从 _proactive_reply 中提取获取 system_prompt 的逻辑。
+        这样可以被 _proactive_reminder_reply 复用。
+        """
+        system_prompt = ""
+        persona_obj = None
+        
+        # 优先使用配置文件中的自定义人格
+        if (self.cfg.get("persona_override") or "").strip():
+            system_prompt = self.cfg.get("persona_override")
+            logger.debug(f"[Conversa] 使用配置文件中的自定义人格")
+        else:
+            persona_mgr = getattr(self.context, "persona_manager", None)
+            if persona_mgr:
+                fixed_persona = (self.cfg.get("_special") or {}).get("persona") or ""
+                persona_id = fixed_persona or (getattr(conversation, "persona_id", "") or "")
+                
+                if persona_id:
+                    try:
+                        if asyncio.iscoroutinefunction(persona_mgr.get_persona):
+                            persona_obj = await persona_mgr.get_persona(persona_id)
+                        else:
+                            persona_obj = persona_mgr.get_persona(persona_id)
+                    except Exception as e:
+                        logger.warning(f"[Conversa] 获取指定人格 {persona_id} 失败: {e}")
+
+                if not persona_obj and conversation:
+                    persona_obj = getattr(conversation, "persona", None)
+
+                if not persona_obj:
+                    for getter_name in ("get_default_persona_v3", "get_default_persona", "get_default"):
+                        getter = getattr(persona_mgr, getter_name, None)
+                        if callable(getter):
+                            try:
+                                if asyncio.iscoroutinefunction(getter):
+                                    persona_obj = await getter(umo)
+                                else:
+                                    persona_obj = getter(umo)
+                            except TypeError:
+                                if asyncio.iscoroutinefunction(getter):
+                                    persona_obj = await getter()
+                                else:
+                                    persona_obj = getter()
+                            if persona_obj:
+                                break
+            
+            if persona_obj:
+                for attr in ("system_prompt", "prompt", "content", "text"):
+                    if hasattr(persona_obj, attr):
+                        prompt_value = getattr(persona_obj, attr, None)
+                        if isinstance(prompt_value, str) and prompt_value.strip():
+                            system_prompt = prompt_value.strip()
+                            break
+                    if isinstance(persona_obj, dict) and attr in persona_obj:
+                        prompt_value = persona_obj[attr]
+                        if isinstance(prompt_value, str) and prompt_value.strip():
+                            system_prompt = prompt_value.strip()
+                            break
+            
+            if not system_prompt and conversation:
+                for attr in ("system_prompt", "prompt"):
+                    if hasattr(conversation, attr):
+                        prompt_value = getattr(conversation, attr, None)
+                        if isinstance(prompt_value, str) and prompt_value.strip():
+                            system_prompt = prompt_value.strip()
+                            break
+                            
+        return system_prompt or ""
 
     async def _check_reminders(self, now: datetime, tz: Optional[str]):
         """
@@ -795,36 +1012,41 @@ class Conversa(Star):
         2. 每日提醒：格式 "HH:MM|daily"，每天相同时间触发，不删除
         """
         fired_ids = []
-        for rid, r in self._reminders.items():
-            if "|daily" in r.at:
-                hhmm = r.at.split("|", 1)[0]
-                t = _parse_hhmm(hhmm)
-                if not t: 
-                    continue
-                if now.hour == t[0] and now.minute == t[1]:
-                    await self._send_text(r.umo, f"⏰ 提醒：{r.content}")
-            else:
-                try:
+        for rid, r in list(self._reminders.items()): # 使用 list 副本以安全地在循环中删除
+            try:
+                if "|daily" in r.at:
+                    hhmm = r.at.split("|", 1)[0]
+                    t = _parse_hhmm(hhmm)
+                    if not t: 
+                        continue
+                    if now.hour == t[0] and now.minute == t[1]:
+                        # 调用 AI 提醒
+                        await self._proactive_reminder_reply(r.umo, r.content)
+                else:
                     dt = datetime.strptime(r.at, "%Y-%m-%d %H:%M")
                     if now.strftime("%Y-%m-%d %H:%M") == dt.strftime("%Y-%m-%d %H:%M"):
-                        await self._send_text(r.umo, f"⏰ 提醒：{r.content}")
+                        # 调用 AI 提醒
+                        await self._proactive_reminder_reply(r.umo, r.content)
                         fired_ids.append(rid)
-                except Exception:
-                    continue
+            except Exception as e:
+                logger.error(f"[Conversa] 检查提醒 {r.id} 时出错: {e}")
+                continue
+        
         for rid in fired_ids:
             self._reminders.pop(rid, None)
         if fired_ids:
             self._save_reminders()
 
     # 主动回复
-    async def _proactive_reply(self, umo: str, hist_n: int, tz: Optional[str]) -> bool:
+    async def _proactive_reply(self, umo: str, hist_n: int, tz: Optional[str], prompt_template: str) -> bool:
         """
-        执行主动回复的核心方法（这是插件最重要的功能！）
+        执行主动回复的核心方法
         
         参数：
             umo: 统一消息来源（会话标识）
             hist_n: 需要获取的历史消息条数
             tz: 时区名称（用于时间格式化）
+            prompt_template: 用于格式化提示词的模板字符串
             
         返回：
             True: 成功发送回复
@@ -839,9 +1061,7 @@ class Conversa(Star):
            - 降级：conversation.persona
            - 兜底：默认人格（get_default_persona_v3等）
         4. 获取完整上下文历史（调用 _safe_get_full_contexts，多策略降级）
-        5. 构造主动回复的 prompt：
-           - 如果配置了 custom_prompts，随机选择一个并格式化
-           - 否则使用默认提示词："请自然地延续对话，与用户继续交流。"
+        5. 使用传入的、特定场景的提示词模板
         6. 调用 LLM 的 text_chat 接口（注意参数名是 contexts 复数！）
         7. 如果配置了 append_time_field，在回复前添加时间戳
         8. 发送消息并更新会话状态
@@ -866,104 +1086,15 @@ class Conversa(Star):
             curr_cid = await conv_mgr.get_curr_conversation_id(umo)
             conversation = await conv_mgr.get_conversation(umo, curr_cid)
 
-            # 获取 system_prompt（多重降级策略）
-            system_prompt = ""
-            persona_obj = None
-            
-            # 优先使用配置文件中的自定义人格
-            if (self.cfg.get("persona_override") or "").strip():
-                system_prompt = self.cfg.get("persona_override")
-                logger.debug(f"[Conversa] 使用配置文件中的自定义人格")
-            else:
-                # 尝试获取 persona_manager
-                persona_mgr = getattr(self.context, "persona_manager", None)
-                if not persona_mgr:
-                    logger.warning(f"[Conversa] persona_manager 不可用")
-                else:
-                    # 策略1: 尝试从配置或 conversation 获取指定的 persona_id
-                    fixed_persona = (self.cfg.get("_special") or {}).get("persona") or ""
-                    persona_id = fixed_persona or (getattr(conversation, "persona_id", "") or "")
-                    
-                    if persona_id:
-                        try:
-                            # 尝试异步调用（如果是异步方法）
-                            if asyncio.iscoroutinefunction(persona_mgr.get_persona):
-                                persona_obj = await persona_mgr.get_persona(persona_id)
-                            else:
-                                persona_obj = persona_mgr.get_persona(persona_id)
-                            
-                            if persona_obj:
-                                logger.debug(f"[Conversa] 成功获取指定人格: {persona_id}")
-                        except Exception as e:
-                            logger.warning(f"[Conversa] 获取指定人格 {persona_id} 失败: {e}")
-                    
-                    # 策略2: 如果没有获取到，尝试从 conversation.persona 直接获取
-                    if not persona_obj and conversation:
-                        persona_obj = getattr(conversation, "persona", None)
-                        if persona_obj:
-                            logger.debug(f"[Conversa] 从 conversation.persona 获取人格")
-                    
-                    # 策略3: 尝试获取默认人格（多种方法）
-                    if not persona_obj:
-                        for getter_name in ("get_default_persona_v3", "get_default_persona", "get_default"):
-                            getter = getattr(persona_mgr, getter_name, None)
-                            if not callable(getter):
-                                continue
-                            try:
-                                # 尝试带参数调用
-                                try:
-                                    if asyncio.iscoroutinefunction(getter):
-                                        persona_obj = await getter(umo)
-                                    else:
-                                        persona_obj = getter(umo)
-                                except TypeError:
-                                    # 不需要参数，直接调用
-                                    if asyncio.iscoroutinefunction(getter):
-                                        persona_obj = await getter()
-                                    else:
-                                        persona_obj = getter()
-                                
-                                if persona_obj:
-                                    logger.debug(f"[Conversa] 通过 {getter_name} 获取默认人格")
-                                    break
-                            except Exception as e:
-                                logger.debug(f"[Conversa] 通过 {getter_name} 获取默认人格失败: {e}")
-                
-                # 从 persona 对象或 conversation 提取 system_prompt
-                if persona_obj:
-                    # 尝试多种属性名
-                    for attr in ("system_prompt", "prompt", "content", "text"):
-                        if hasattr(persona_obj, attr):
-                            prompt_value = getattr(persona_obj, attr, None)
-                            if isinstance(prompt_value, str) and prompt_value.strip():
-                                system_prompt = prompt_value.strip()
-                                logger.info(f"[Conversa] 从 persona.{attr} 获取 system_prompt")
-                                break
-                        # 如果是字典
-                        if isinstance(persona_obj, dict) and attr in persona_obj:
-                            prompt_value = persona_obj[attr]
-                            if isinstance(prompt_value, str) and prompt_value.strip():
-                                system_prompt = prompt_value.strip()
-                                logger.info(f"[Conversa] 从 persona['{attr}'] 获取 system_prompt")
-                                break
-                
-                # 最后尝试从 conversation 直接获取
-                if not system_prompt and conversation:
-                    for attr in ("system_prompt", "prompt"):
-                        if hasattr(conversation, attr):
-                            prompt_value = getattr(conversation, attr, None)
-                            if isinstance(prompt_value, str) and prompt_value.strip():
-                                system_prompt = prompt_value.strip()
-                                logger.info(f"[Conversa] 从 conversation.{attr} 获取 system_prompt")
-                                break
+            # 获取 system_prompt（已重构为公共函数）
+            system_prompt = await self._get_system_prompt(umo, conversation)
             
             if not system_prompt:
                 logger.warning(f"[Conversa] 未能获取任何 system_prompt，将使用空值")
 
-            # 获取完整上下文（使用新的安全方法，传入已获取的 conversation 对象）
+            # 获取完整上下文
             contexts: List[Dict] = []
             try:
-                # 传入已获取的 conversation 对象，优先从它获取历史
                 contexts = await self._safe_get_full_contexts(umo, conversation)
                 
                 # 限制历史条数
@@ -975,12 +1106,8 @@ class Conversa(Star):
                 logger.error(f"[Conversa] 获取上下文时出错: {e}")
                 contexts = []
 
-            # 获取自定义提示词列表
-            custom_prompts = self.cfg.get("custom_prompts") or []
-            
-            if custom_prompts and len(custom_prompts) > 0:
-                # 随机选择一个提示词
-                templ = random.choice(custom_prompts).strip()
+            # 使用传入的、特定场景的提示词模板
+            if prompt_template:
                 last_user = ""
                 last_ai = ""
                 for m in reversed(contexts):
@@ -990,11 +1117,11 @@ class Conversa(Star):
                         last_ai = m.get("content", "")
                     if last_user and last_ai:
                         break
-                prompt = templ.format(now=_fmt_now(self.cfg.get("time_format") or "%Y-%m-%d %H:%M", tz), last_user=last_user, last_ai=last_ai, umo=umo)
+                prompt = prompt_template.format(now=_fmt_now(self.cfg.get("time_format") or "%Y-%m-%d %H:%M", tz), last_user=last_user, last_ai=last_ai, umo=umo)
             else:
+                # 降级为默认提示词
                 prompt = "请自然地延续对话，与用户继续交流。"
 
-            # 调试模式：显示完整上下文（已可删除）
             if self.cfg.get("debug_mode", False):
                 logger.info(f"[Conversa] ========== 调试模式开始 ==========")
                 logger.info(f"[Conversa] 用户: {umo}")
@@ -1031,16 +1158,19 @@ class Conversa(Star):
             await self._send_text(umo, text)
             logger.info(f"[Conversa] 已发送主动回复给 {umo}: {text[:50]}...")
 
-            # 更新最后时间戳为AI发送消息的时间，并把AI回复写入轻量历史，方便下次回退
+            # 更新最后时间戳为AI发送消息的时间，并把AI回复写入上下文缓存（仅订阅用户）
             now_ts = _now_tz(tz).timestamp()
             st = self._states.get(umo)
-            if st:
+            profile = self._user_profiles.get(umo)
+            context_cache = self._context_caches.get(umo)
+            if st and profile and profile.subscribed:
                 st.last_ts = now_ts
                 try:
-                    st.history.append({"role": "assistant", "content": text})
+                    context_cache.append({"role": "assistant", "content": text})
                 except Exception:
                     pass
-                self._save_states()
+                self._save_session_states()
+                self._save_context_caches()
             
             return True
         except Exception as e:
@@ -1121,6 +1251,8 @@ class Conversa(Star):
                 self.cfg["after_last_msg_minutes"] = 0
                 self.cfg["append_time_field"] = False
                 self.cfg["daily"] = {}
+                self.cfg["daily_prompts"] = {} # 新增：清理每日定时提示词
+                self.cfg["idle_prompt_templates"] = [] # 新增：清理空闲触发提示词
                 self.cfg["subscribe_mode"] = "manual"
                 self.cfg["debug_mode"] = False
                 self.cfg["_special"] = {}
@@ -1135,10 +1267,19 @@ class Conversa(Star):
                 if os.path.exists(self._state_path):
                     os.remove(self._state_path)
                     logger.info(f"[Conversa] 已删除状态文件: {self._state_path}")
+                if os.path.exists(self._user_profiles_path):
+                    os.remove(self._user_profiles_path)
+                    logger.info(f"[Conversa] 已删除用户配置文件: {self._user_profiles_path}")
+                if os.path.exists(self._context_cache_path):
+                    os.remove(self._context_cache_path)
+                    logger.info(f"[Conversa] 已删除上下文缓存文件: {self._context_cache_path}")
                 if os.path.exists(self._remind_path):
                     os.remove(self._remind_path)
                     logger.info(f"[Conversa] 已删除提醒文件: {self._remind_path}")
-                
+                if os.path.exists(self._session_states_path):
+                    os.remove(self._session_states_path)
+                    logger.info(f"[Conversa] 已删除会话状态文件: {self._session_states_path}")
+
                 # 如果数据目录为空，删除整个目录
                 if os.path.exists(self._data_dir) and not os.listdir(self._data_dir):
                     os.rmdir(self._data_dir)
@@ -1149,7 +1290,9 @@ class Conversa(Star):
             # 插件被停用 - 只保存状态，不清理数据
             logger.info("[Conversa] 检测到插件停用，保存状态...")
             try:
-                self._save_states()
+                self._save_session_states()
+                self._save_user_profiles()
+                self._save_context_caches()
                 self._save_reminders()
                 logger.info("[Conversa] 状态已保存")
             except Exception as e:

@@ -14,21 +14,57 @@
     "type": "int",
     "default": 0
   },
-  "daily": {
-    "description": "每天两档定时触发（相互不冲突；若相同自动错峰1分钟）",
+  "idle_prompt_templates": {
+    "description": "【间隔触发】的提示词模板列表（用户N分钟未回复时触发，会从中随机选择一个）",
+    "type": "list",
+    "default": [
+      "【任务：这是一条静默提醒，专门用于触发你在【一对一私聊】场景下的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了\"系统提醒\"或\"任务指令\"。你的行为必须完全符合你的人设，就像一个真正的人在和朋友私聊。行动指南：现在的时间：{now}；根据这个时间对用户进行一些符合上述聊天记录内容或生活化的问候。】",
+      "【任务：这是一条静默提醒，专门用于触发你在【一对一私聊】场景下的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了\"系统提醒\"或\"任务指令\"。你的行为必须完全符合你的人设，就像一个真正的人在和朋友私聊。行动指南：分析之前的聊天，注意到距离上次聊天已经过了一段时间，自然的询问事情的进展或刚才聊过的话题中的某一个】"
+    ],
+    "items": {
+      "type": "string"
+    }
+  },
+  "daily_prompts": {
+    "description": "【每日定时触发】的三个时间点及其专属提示词",
     "type": "object",
     "items": {
       "time1": {
-        "description": "HH:MM（24h）",
+        "description": "每日定时1 - 时间 (HH:MM)",
         "type": "string",
         "default": ""
       },
+      "prompt1": {
+        "description": "每日定时1 - 专属提示词 (支持 {now}, {umo} 等占位符)",
+        "type": "text",
+        "default": "早上好！新的一天开始了，今天有什么计划吗？"
+      },
       "time2": {
-        "description": "HH:MM（24h）",
+        "description": "每日定时2 - 时间 (HH:MM)",
         "type": "string",
         "default": ""
+      },
+      "prompt2": {
+        "description": "每日定时2 - 专属提示词",
+        "type": "text",
+        "default": "晚上好，今天过得怎么样？"
+      },
+      "time3": {
+        "description": "每日定时3 - 时间 (HH:MM)",
+        "type": "string",
+        "default": ""
+      },
+      "prompt3": {
+        "description": "每日定时3 - 专属提示词",
+        "type": "text",
+        "default": "晚安，祝你有个好梦。"
       }
     }
+  },
+  "persona_override": {
+    "description": "覆盖默认人格的 System Prompt（留空使用当前会话人格）。",
+    "type": "text",
+    "default": ""
   },
   "quiet_hours": {
     "description": "免打扰时段（不触发主动回复），格式 HH:MM-HH:MM，可跨天",
@@ -39,19 +75,6 @@
     "description": "拼接最近聊天记录条数（从当前对话历史中提取）",
     "type": "int",
     "default": 50
-  },
-  "persona_override": {
-    "description": "自定义人格 System Prompt（留空使用当前对话人格）",
-    "type": "text",
-    "default": ""
-  },
-  "custom_prompts": {
-    "description": "自定义提示词列表（可用占位符：{now}、{last_user}、{last_ai}、{umo}）。每次触发时随机选择一个。为空则让模型自然续聊",
-    "type": "list",
-    "default": [
-      "【任务：这是一条静默提醒，专门用于触发你在【一对一私聊】场景下的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了'系统提醒'或'任务指令'。你的行为必须完全符合你的人设，就像一个真正的人在和朋友私聊。行动指南：现在的时间：{now}；根据这个时间对用户进行一些符合上述聊天记录内容或生活化的问候。】",
-      "【任务：这是一条静默提醒，专门用于触发你在【一对一私聊】场景下的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了'系统提醒'或'任务指令'。你的行为必须完全符合你的人设，就像一个真正的人在和朋友私聊。行动指南：分析之前的聊天，注意到距离上次聊天已经过了一段时间，自然的询问事情的进展或刚才聊过的话题中的某一个】"
-    ]
   },
   "append_time_field": {
     "description": "在消息前追加时间字段（例如“[2025-10-21 09:30] ”）",
@@ -83,9 +106,39 @@
     "default": false
   },
   "reply_interval_seconds": {
-    "description": "多用户同时触发时的间隔秒数（避免API限流，推荐10-20）",
+    "description": "多用户同时触发时的间隔秒数（避免API限流，推荐10-20）【1.1.0 新增】",
     "type": "int",
     "default": 20
+  },
+  "enable_daily_greetings": {
+    "description": "开启每日问候（按 daily_prompts 的时间与提示词触发）",
+    "type": "bool",
+    "default": true
+  },
+  "enable_idle_greetings": {
+    "description": "开启延时问候（用户一段时间未互动后触发）",
+    "type": "bool",
+    "default": true
+  },
+  "idle_trigger_mode": {
+    "description": "延时问候触发模式：fixed（固定分钟）或 random_window（随机窗口）",
+    "type": "text",
+    "default": "fixed"
+  },
+  "idle_after_minutes": {
+    "description": "fixed 模式：最后消息后 N 分钟触发",
+    "type": "int",
+    "default": 45
+  },
+  "idle_after_min_minutes": {
+    "description": "random_window 模式：最小分钟数",
+    "type": "int",
+    "default": 30
+  },
+  "idle_after_max_minutes": {
+    "description": "random_window 模式：最大分钟数（需大于最小值）",
+    "type": "int",
+    "default": 90
   },
   "subscribed_users": {
     "description": "订阅用户列表（用户ID，支持直接添加/删除）",
@@ -94,6 +147,11 @@
     "items": {
       "type": "string"
     }
+  },
+  "reminder_prompt_template": {
+    "description": "AI 主动提醒的提示词模板。必须包含 {reminder_content} 占位符。",
+    "type": "text",
+    "default": "这是一个主动提醒任务，用户希望你能够根据以下内容进行提醒：{reminder_content}。请你分析上下文，并用自然、符合人设的语气，将这个提醒巧妙地融入对话中，而不是生硬地直接重复提醒内容。"
   },
   "_special": {
     "description": "可视化选择默认聊天模型/人格（可选）",
