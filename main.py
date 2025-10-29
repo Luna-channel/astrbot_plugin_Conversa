@@ -1,25 +1,22 @@
-"""
-Conversa - AI 定时主动续聊插件
-支持人格与上下文记忆、定时问候、延时提醒、用户提醒等功能
-"""
+
 from __future__ import annotations
 
-# === 标准库导入 ===
 import asyncio
 import json
 import os
 import random
 import re
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, time
+from collections import  deque
+from dataclasses import dataclass
+from datetime import datetime, time
 from typing import Dict, List, Optional, Deque, Tuple
 
-# === AstrBot API 导入 ===
 import astrbot.api.message_components as Comp
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, register, StarTools
+from astrbot.const import PluginData, PluginHook, Switch, default_persona
+from astrbot.api.provider import ProviderRequest, LLMResponse
 
 # 工具函数
 def _ensure_dir(p: str) -> str:
@@ -76,7 +73,7 @@ def _fmt_now(fmt: str, tz: str | None) -> str:
 class UserProfile:
     """用户订阅信息和个性化设置"""
     subscribed: bool = False
-    idle_after_minutes: int | None = None  # None 表示使用全局默认
+    idle_after_minutes: int | None = None  
     daily_reminders_enabled: bool = True
     daily_reminder_count: int = 3
 
@@ -160,19 +157,8 @@ class Reminder:
 @register("Conversa", "柯尔", "AI 定时主动续聊 · 支持人格与上下文记忆", "1.0.0", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
-    """
-    Conversa 主动对话插件
-    
-    核心功能：
-    1. 延时问候：在用户消息后一段时间主动发起对话
-    2. 每日定时：在固定时间点主动问候（最多3个时段）
-    3. 用户提醒：支持一次性和每日提醒，由AI生成自然语言提醒
-    4. 订阅管理：支持手动/自动订阅模式，按用户粒度管理
-    5. 上下文记忆：多级降级策略获取对话历史
-    """
 
     # 初始化
-    
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.cfg: AstrBotConfig = config
@@ -190,14 +176,6 @@ class Conversa(Star):
         self._user_data_path = os.path.join(self._data_dir, "user_data.json")
         self._session_data_path = os.path.join(self._data_dir, "session_data.json")
         
-        # 配置辅助函数
-        def _get_cfg(group_key: str, sub_key: str, default=None):
-            """安全地从嵌套配置字典中获取值"""
-            group = self.cfg.get(group_key) or {}
-            return group.get(sub_key, default)
-        
-        self._get_cfg = _get_cfg
-        
         # 加载数据
         self._load_user_data()
         self._load_session_data()
@@ -206,6 +184,14 @@ class Conversa(Star):
         # 启动后台调度器
         self._loop_task = asyncio.create_task(self._scheduler_loop())
         logger.info("[Conversa] Scheduler started.")
+
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        """检查事件发送者是否为AstrBot管理员"""
+        return event.role == "admin"
+
+    def _get_cfg(self, group_key: str, sub_key: str, default=None):
+        group = self.cfg.get(group_key) or {}
+        return group.get(sub_key, default)
 
     # 数据持久化
     def _load_user_data(self):
@@ -284,7 +270,7 @@ class Conversa(Star):
         try:
             config_subscribed_ids = self._get_cfg("basic_settings", "subscribed_users") or []
             if not isinstance(config_subscribed_ids, list):
-                logger.warning(f"[Conversa] subscribed_users 配置格式错误，应为列表")
+                logger.warning(f"[Conversa] subscribed_users 配置格式错误，应为列表")  # noqa: F541
                 return
             
             for user_id, profile in self._user_profiles.items():
@@ -406,18 +392,30 @@ class Conversa(Star):
         - remind add/list/del: 管理提醒事项
         """
         text = (event.message_str or "").strip()
-        lower = text.lower()
+        
+        # 动态处理主命令和别名
+        command_parts = text.lstrip('/').split()
+        if not command_parts:
+            return
+        
+        # 提取真实命令和参数
+        triggered_command = command_parts[0].lower()
+        args_str = " ".join(command_parts[1:]) if len(command_parts) > 1 else ""
+        
+        # 将参数字符串分割成子命令和值
+        args = args_str.split()
+        sub_command = args[0] if args else ""
 
         def reply(msg: str):
             return event.plain_result(msg)
 
         # 帮助信息
-        if "help" in lower or text.strip() in ["/conversa", "/cvs"]:
+        if not sub_command or sub_command == "help":
             yield reply(self._help_text())
             return
-
-            # 调试信息
-        if " debug" in lower:
+            
+        # 调试信息
+        if sub_command == "debug":
             debug_info = [
                 f"插件启用状态: {self.cfg.get('enable', True)}",
                 f"订阅模式: {self._get_cfg('basic_settings', 'subscribe_mode', 'manual')}",
@@ -435,7 +433,10 @@ class Conversa(Star):
             return
 
         # 启用/停用插件
-        if " on" in lower:
+        if sub_command == "on":
+            if not self._is_admin(event):
+                yield event.plain_result("错误：此命令仅限管理员使用。")
+                return
             self.cfg["enable"] = True
             self.cfg["basic_settings"] = self.cfg.get("basic_settings") or {}
             self.cfg["basic_settings"]["enable"] = True
@@ -443,7 +444,10 @@ class Conversa(Star):
             yield reply("✅ 已启用 Conversa")
             return
         
-        if " off" in lower:
+        if sub_command == "off":
+            if not self._is_admin(event):
+                yield event.plain_result("错误：此命令仅限管理员使用。")
+                return
             self.cfg["enable"] = False
             self.cfg["basic_settings"] = self.cfg.get("basic_settings") or {}
             self.cfg["basic_settings"]["enable"] = False
@@ -452,7 +456,7 @@ class Conversa(Star):
             return
 
         # 订阅/退订
-        if " watch" in lower:
+        if sub_command == "watch":
             umo = event.unified_msg_origin
             if umo not in self._user_profiles:
                 self._user_profiles[umo] = UserProfile()
@@ -462,7 +466,7 @@ class Conversa(Star):
             yield reply("📌 已订阅当前会话")
             return
 
-        if " unwatch" in lower:
+        if sub_command == "unwatch":
             umo = event.unified_msg_origin
             if umo not in self._user_profiles:
                 self._user_profiles[umo] = UserProfile()
@@ -472,7 +476,7 @@ class Conversa(Star):
             return
 
         # 显示配置
-        if " show" in lower:
+        if sub_command == "show":
             umo = event.unified_msg_origin
             profile = self._user_profiles.get(umo)
             st = self._states.get(umo)
@@ -505,125 +509,145 @@ class Conversa(Star):
             yield reply("当前配置/状态：\n" + json.dumps(info, ensure_ascii=False, indent=2))
             return
 
-        # set after 命令
-        m = re.search(r"set\s+after\s+(\d+)", text, re.I)
-        if m:
-            umo = event.unified_msg_origin
-            profile = self._user_profiles.get(umo)
-            if not profile:
-                self._user_profiles[umo] = UserProfile()
-                profile = self._user_profiles[umo]
+        # set 命令
+        if sub_command == "set":
+            if len(args) < 3:
+                yield reply(self._help_text())
+                return
             
-            try:
-                hours = int(m.group(1))
-                if 2 <= hours <= 48:
-                    profile.idle_after_minutes = hours * 60
-                    self._save_user_data()
-                    yield reply(f"⏱️ 已为您设置专属延时问候：{hours} 小时后触发（会叠加后台随机波动）")
+            set_target = args[1]
+            set_value = " ".join(args[2:])
+
+            if set_target == "after":
+                umo = event.unified_msg_origin
+                profile = self._user_profiles.get(umo)
+                if not profile:
+                    self._user_profiles[umo] = UserProfile()
+                    profile = self._user_profiles[umo]
+                
+                try:
+                    minutes = int(set_value)
+                    if minutes >= 30:
+                        profile.idle_after_minutes = minutes
+                        self._save_user_data()
+                        yield reply(f"⏱️ 已为您设置专属延时问候：{minutes} 分钟后触发")
+                    else:
+                        yield reply("⏱️ 延时问候的分钟数不能少于30。")
+                except ValueError:
+                    yield reply("⏱️ 请输入有效的分钟数。")
+                return
+
+            if set_target.startswith("daily"):
+                match = re.match(r"daily([1-3])", set_target)
+                if match and len(args) >= 4:
+                    n = int(match.group(1))
+                    time_val = args[3]
+                    
+                    slot_cfg = self.cfg.get("daily_prompts") or {}
+                    slot_cfg[f"slot{n}"] = slot_cfg.get(f"slot{n}", {})
+                    slot_cfg[f"slot{n}"]["time"] = time_val
+                    slot_cfg[f"slot{n}"]["enable"] = True
+                    self.cfg["daily_prompts"] = slot_cfg
+                    
+                    self.cfg["basic_settings"] = self.cfg.get("basic_settings") or {}
+                    self.cfg["basic_settings"]["enable_daily_greetings"] = True
+                    self.cfg.save_config()
+                    yield reply(f"🗓️ 已设置 daily{n}：{time_val}")
                 else:
-                    yield reply("⏱️ 请输入2到48之间的小时数。")
-            except ValueError:
-                yield reply("⏱️ 请输入有效的小时数。")
-            return
+                    yield reply("用法: /conversa set daily[1-3] <HH:MM>")
+                return
 
-        # set daily 命令
-        m = re.search(r"set\s+daily([1-3])\s+(\d{1,2}:\d{2})", lower)
-        if m:
-            n = int(m.group(1))
-            t = m.group(2)
+            if set_target == "quiet":
+                if not self._is_admin(event):
+                    yield event.plain_result("错误：此命令仅限管理员使用。")
+                    return
+                if re.match(r"^\d{1,2}:\d{2}-\d{1,2}:\d{2}$", set_value):
+                    settings = self.cfg.get("basic_settings") or {}
+                    settings["quiet_hours"] = set_value
+                    self.cfg["basic_settings"] = settings
+                    self.cfg.save_config()
+                    yield reply(f"🔕 已设置免打扰：{set_value}")
+                else:
+                    yield reply("格式错误，请使用 HH:MM-HH:MM 格式。")
+                return
             
-            slot_cfg = self.cfg.get("daily_prompts") or {}
-            slot_cfg[f"slot{n}"] = slot_cfg.get(f"slot{n}", {})
-            slot_cfg[f"slot{n}"]["time"] = t
-            slot_cfg[f"slot{n}"]["enable"] = True
-            self.cfg["daily_prompts"] = slot_cfg
-            
-            self.cfg["basic_settings"] = self.cfg.get("basic_settings") or {}
-            self.cfg["basic_settings"]["enable_daily_greetings"] = True
-            self.cfg.save_config()
-            yield reply(f"🗓️ 已设置 daily{n}：{t}")
-            return
-
-        # set quiet 命令
-        m = re.search(r"set\s+quiet\s+(\d{1,2}:\d{2})-(\d{1,2}:\d{2})", lower)
-        if m:
-            settings = self.cfg.get("basic_settings") or {}
-            settings["quiet_hours"] = f"{m.group(1)}-{m.group(2)}"
-            self.cfg["basic_settings"] = settings
-            self.cfg.save_config()
-            yield reply(f"🔕 已设置免打扰：{settings['quiet_hours']}")
-            return
-
-        # set history 命令
-        mp = re.search(r"set\s+history\s+(\d+)", lower)
-        if mp:
-            settings = self.cfg.get("basic_settings") or {}
-            settings["history_depth"] = int(mp.group(1))
-            self.cfg["basic_settings"] = settings
-            self.cfg.save_config()
-            yield reply(f"🧵 已设置历史条数：{mp.group(1)}")
-            return
+            if set_target == "history":
+                if not self._is_admin(event):
+                    yield event.plain_result("错误：此命令仅限管理员使用。")
+                    return
+                try:
+                    depth = int(set_value)
+                    settings = self.cfg.get("basic_settings") or {}
+                    settings["history_depth"] = depth
+                    self.cfg["basic_settings"] = settings
+                    self.cfg.save_config()
+                    yield reply(f"🧵 已设置历史条数：{depth}")
+                except ValueError:
+                    yield reply("请输入有效的数字。")
+                return
 
         # prompt 命令（已移至 WebUI）
-        if " prompt " in lower:
+        if sub_command == "prompt":
             yield reply("📝 提示词管理功能已移至 WebUI 配置页面。")
             return
 
         # remind 命令
-        if " remind " in lower or lower.endswith(" remind"):
+        if sub_command == "remind":
             if not bool(self._get_cfg("reminders_settings", "enable_reminders", True)):
                 yield reply("提醒功能已被管理员禁用。")
                 return
             
-            parts = text.split()
-            if len(parts) >= 3 and parts[1].lower() == "remind":
-                sub = parts[2].lower()
-                
-                if sub == "list":
-                    yield reply(self._remind_list_text(event.unified_msg_origin))
-                    return
-                
-                if sub == "del" and len(parts) >= 4:
-                    rid = parts[3].strip()
-                    if rid in self._reminders and self._reminders[rid].umo == event.unified_msg_origin:
-                        del self._reminders[rid]
-                        self._save_user_data()
-                        yield reply(f"🗑️ 已删除提醒 {rid}")
-                    else:
-                        yield reply("未找到该提醒 ID")
-                    return
-                
-                if sub == "add":
-                    txt = text.split("add", 1)[1].strip()
-                    m1 = re.match(r"^(\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2})\s+(.+)$", txt)
-                    m2 = re.match(r"^(\d{1,2}:\d{2})\s+(.+?)\s+daily$", txt, flags=re.I)
-                    rid = f"R{int(datetime.now().timestamp())}"
-                    
-                    if m1:
-                        self._reminders[rid] = Reminder(
-                            id=rid,
-                            umo=event.unified_msg_origin,
-                            content=m1.group(2).strip(),
-                            at=m1.group(1).strip(),
-                            created_at=datetime.now().timestamp()
-                        )
-                        self._save_user_data()
-                        yield reply(f"⏰ 已添加一次性提醒 {rid}")
-                        return
-                    elif m2:
-                        hhmm = m2.group(1)
-                        self._reminders[rid] = Reminder(
-                            id=rid,
-                            umo=event.unified_msg_origin,
-                            content=m2.group(2).strip(),
-                            at=f"{hhmm}|daily",
-                            created_at=datetime.now().timestamp()
-                        )
-                        self._save_user_data()
-                        yield reply(f"⏰ 已添加每日提醒 {rid}")
-                        return
+            remind_sub_command = args[1].lower() if len(args) > 1 else ""
+
+            if remind_sub_command == "list":
+                yield reply(self._remind_list_text(event.unified_msg_origin))
+                return
             
-            yield reply("用法：/conversa remind add <YYYY-MM-DD HH:MM> <内容>  或  /conversa remind add <HH:MM> <内容> daily")
+            if remind_sub_command == "del" and len(args) >= 3:
+                rid = args[2].strip()
+                if rid in self._reminders and self._reminders[rid].umo == event.unified_msg_origin:
+                    del self._reminders[rid]
+                    self._save_user_data()
+                    yield reply(f"🗑️ 已删除提醒 {rid}")
+                else:
+                    yield reply("未找到该提醒 ID")
+                return
+            
+            if remind_sub_command == "add":
+                remind_content = " ".join(args[2:])
+                # 匹配 HH:MM 格式
+                m_daily = re.match(r"^(\d{1,2}:\d{2})\s+(.+)$", remind_content)
+                # 匹配 YYYY-MM-DD HH:MM 格式
+                m_once = re.match(r"^(\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2})\s+(.+)$", remind_content)
+                
+                rid = f"R{int(datetime.now().timestamp())}"
+                
+                if m_once:
+                    at_time, content = m_once.groups()
+                    self._reminders[rid] = Reminder(
+                        id=rid,
+                        umo=event.unified_msg_origin,
+                        content=content.strip(),
+                        at=at_time.strip(),
+                        created_at=datetime.now().timestamp()
+                    )
+                    self._save_user_data()
+                    yield reply(f"⏰ 已添加一次性提醒 {rid}")
+                    return
+                elif m_daily:
+                    hhmm, content = m_daily.groups()
+                    self._reminders[rid] = Reminder(
+                        id=rid,
+                        umo=event.unified_msg_origin,
+                        content=content.strip(),
+                        at=f"{hhmm}|daily",
+                        created_at=datetime.now().timestamp()
+                    )
+                    self._save_user_data()
+                    yield reply(f"⏰ 已添加每日提醒 {rid}")
+                    return
+            
+            yield reply(self._help_text())
             return
 
         # 默认显示帮助
@@ -632,18 +656,15 @@ class Conversa(Star):
     def _help_text(self) -> str:
         """返回插件的帮助文本"""
         return (
-            "Conversa 帮助 (指令: /conversa 或 /cvs)：\n"
-            "/conversa on|off - 启用/停用插件\n"
-            "/conversa watch - 订阅当前会话\n"
-            "/conversa unwatch - 退订当前会话\n"
-            "/conversa show - 显示当前配置\n"
-            "/conversa debug - 显示调试信息\n"
-            "/conversa set after <小时> - 设置专属延时问候(2-48小时)\n"
-            "/conversa set daily[1-3] <HH:MM> - 设置三个每日定时触发时间\n"
-            "/conversa set quiet <HH:MM-HH:MM> - 设置免打扰\n"
-            "/conversa set history <N> - 设置历史条数\n"
-            "（提示词管理已移至WebUI）\n"
-            "/conversa remind add/list/del - 管理提醒\n"
+            "--- Conversa 插件帮助 (指令: /conversa 或 /cvs) ---\n"
+            "/conversa on/off - (管理员)全局启用或禁用插件\n"
+            "/conversa watch/unwatch - 订阅或退订当前会话\n"
+            "/conversa set after <分钟> - x分钟无聊天后主动问候（最低30）\n"
+            "/conversa remind <add/list/del> [参数...]\n"
+            "  - add <HH:MM> <提醒内容> - 添加一个每日提醒，可以直接使用自然语言，如：提醒我早睡\n"
+            "  - list - 显示当前会话的所有提醒\n"
+            "  - del <编号> - 删除指定编号的提醒\n"
+            "/conversa status - 显示当前会话状态"
         )
 
     def _remind_list_text(self, umo: str) -> str:
@@ -877,7 +898,7 @@ class Conversa(Star):
             # 获取 System Prompt
             system_prompt = await self._get_system_prompt(umo, conversation)
             if not system_prompt:
-                logger.warning(f"[Conversa] 未能获取任何 system_prompt，将使用空值")
+                logger.warning(f"[Conversa] 未能获取任何 system_prompt，将使用空值")  # noqa: F541
             
             # 获取上下文
             contexts: List[Dict] = []
@@ -912,16 +933,16 @@ class Conversa(Star):
             
             # 调试模式
             if (self.cfg.get("special") or {}).get("debug_mode", False):
-                logger.info(f"[Conversa] ========== 调试模式开始 ==========")
+                logger.info(f"[Conversa] ========== 调试模式开始 ==========")  # noqa: F541
                 logger.info(f"[Conversa] 用户: {umo}")
                 logger.info(f"[Conversa] 系统提示词长度: {len(system_prompt) if system_prompt else 0} 字符")
                 if system_prompt:
                     logger.info(f"[Conversa] 系统提示词前100字符: {system_prompt[:100]}...")
                 else:
-                    logger.warning(f"[Conversa] ⚠️ 警告：system_prompt 为空！")
+                    logger.warning(f"[Conversa] ⚠️ 警告：system_prompt 为空！")  # noqa: F541
                 logger.info(f"[Conversa] 用户提示词: {prompt}")
                 logger.info(f"[Conversa] 上下文历史共 {len(contexts)} 条")
-                logger.info(f"[Conversa] ========== 调试模式结束 ==========")
+                logger.info("[Conversa] ========== 调试模式结束 ==========")
             
             # 调用 LLM
             llm_resp = await provider.text_chat(
@@ -1026,7 +1047,7 @@ class Conversa(Star):
         # 优先使用配置文件中的自定义人格
         if (self._get_cfg("basic_settings", "persona_override") or "").strip():
             system_prompt = self._get_cfg("basic_settings", "persona_override")
-            logger.debug(f"[Conversa] 使用配置文件中的自定义人格")
+            logger.debug("[Conversa] 使用配置文件中的自定义人格")
         else:
             persona_mgr = getattr(self.context, "persona_manager", None)
             if persona_mgr:
@@ -1202,29 +1223,6 @@ class Conversa(Star):
             logger.error(f"[Conversa] send_message error({umo}): {e}")
 
     # 生命周期管理
-    
-    def terminate(self):
-        """插件卸载/停用时的清理方法"""
-        if self._loop_task:
-            self._loop_task.cancel()
-            logger.info("[Conversa] Scheduler stopped.")
-            
-            # 清理数据文件
-        files_to_delete = [self._user_data_path, self._session_data_path]
-        for file_path in files_to_delete:
-            try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                    logger.info(f"[Conversa] Cleaned up data file: {file_path}")
-            except OSError as e:
-                logger.error(f"[Conversa] Error cleaning up data file {file_path}: {e}")
-        
-        # 尝试删除数据目录（如果为空）
-        try:
-                if os.path.exists(self._data_dir) and not os.listdir(self._data_dir):
-                    os.rmdir(self._data_dir)
-                logger.info(f"[Conversa] Cleaned up data directory: {self._data_dir}")
-        except OSError as e:
-            logger.error(f"[Conversa] Error cleaning up data directory {self._data_dir}: {e}")
-        
-        logger.info("[Conversa] Terminated.")
+    async def terminate(self):
+        """插件销毁"""
+        logger.info("[Conversa] 插件已停止")

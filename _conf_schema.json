@@ -38,7 +38,7 @@
         "default": 3
       },
       "persona_override": {
-        "description": "覆盖默认人格的 System Prompt，如果最下方的人格配置没有生效，请手动将人格设置复制到此处",
+        "description": "自定义人格（如果最下方的人格配置没有生效，请手动将人格设置复制到此处）",
         "type": "text",
         "default": ""
       },
@@ -48,7 +48,7 @@
         "default": 50
       },
       "reply_interval_seconds": {
-        "description": "多用户同时触发时的间隔秒数（防止并发过多引发的漏回和报错，推荐设置为20)",
+        "description": "同时触发时的间隔秒数（防止并发过多，推荐设置为20)",
         "type": "int",
         "default": 20
       },
@@ -71,7 +71,7 @@
       "daily1_enable": {
         "description": "启用每日定时1",
         "type": "bool",
-        "default": true
+        "default": false
       },
       "time1": {
         "description": "每日定时1 - 时间 (HH:MM)",
@@ -86,7 +86,7 @@
       "daily2_enable": {
         "description": "启用每日定时2",
         "type": "bool",
-        "default": true
+        "default": false
       },
       "time2": {
         "description": "每日定时2 - 时间 (HH:MM)",
