@@ -1,11 +1,12 @@
 # Conversa · AI 主动续聊插件 for AstrBot
 
 > **作者**：柯尔 (Luna-channel)  
-> **版本**：v1.1.0  
+> **版本**：v1.2.0  
 > **仓库**：<https://github.com/Luna-channel/astrbot_plugin_Conversa>  
 
-Conversa 是一款为 AstrBot 设计的 AI 主动对话插件。它能够在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候。插件深度集成了 AstrBot 的人格系统和上下文记忆，使得每一次主动对话都自然、贴切。
+Conversa 是一款为 AstrBot 设计的 AI 主动对话插件。它能够在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。
 
+目前有bug，无法正确将主动回复的信息加入上下文，请注意。
 ---
 
 ## 📝 版本说明
@@ -20,6 +21,25 @@ Conversa 是一款为 AstrBot 设计的 AI 主动对话插件。它能够在会�
 ---
 
 ## ✨ 更新日志
+
+### **v1.2.0 (2025-11-01) - 测试版**
+
+- **🔥 优化代码结构**：优化了一些历史遗留问题
+- **📝 大幅增强 调试日志系统**：
+  - 为上下文获取添加了详细的分步日志记录，包括策略选择、数据类型、长度等关键信息
+  - 为人格获取添加了全程追踪日志，包括ID获取、对象提取、属性检查等每个步骤
+  - 为消息标准化过程添加了详细记录，帮助识别数据格式问题
+  - 主动回复时记录关键信息，便于问题排查
+- **🛠️ 代码质量提升**：
+  - **简化上下文获取**：从嵌套if-else优化为清晰的策略分层函数
+  - **简化人格获取**：从5层降级优化为2层降级
+  - **优化消息发送**：使用文档推荐的 `MessageChain().message()` 方式，符合AstrBot官方规范
+  - **改进错误处理**：避免单个消息处理失败影响整体功能
+- **⚡ 架构优化**：
+  - 采用函数分解替代累赘的if-else嵌套，提高代码可维护性
+  - 保持必要的稳定性功能（多重降级策略），同时大幅简化代码结构
+  - 代码行数减少，可读性和维护性显著提升
+- **⚠️ 已知问题**：插件主动发送的AI消息目前无法进入对话历史。
 
 ### **v1.1.0 (2025-10-29)**
 
@@ -57,7 +77,7 @@ Conversa 是一款为 AstrBot 设计的 AI 主动对话插件。它能够在会�
 1. 从 Release 或本仓库获取插件包，解压到：  
    `AstrBot/data/plugins/astrbot_plugin_conversa/`
 2. 启动（或重启）AstrBot。
-3. 进入 WebUI → **插件** → 启用 **AIReplay**。
+3. 进入 WebUI → **插件** → 启用 **conversa**。
 4. （可选）在插件配置页完成参数设置。
 
 目录结构示例：
@@ -93,7 +113,7 @@ AstrBot/
 |---|---|---:|---|
 | `enable` | bool | `true` | 启用/停用插件。 |
 | `timezone` | string | `""` | IANA 时区（示例 `Asia/Shanghai`、`America/Los_Angeles`）。为空使用系统时区。 |
-| `after_last_msg_minutes` | int | `0` | 最后一条消息后 N 分钟主动续聊。`0` 代表关闭此触发器。 |
+| `idle_after_minutes` | int | `1200` | 延时问候基准时间（分钟）。实际触发时间为"基准 ± 随机波动"。 |
 | `daily.time1` | string | `""` | 每日触发时间 1（`HH:MM`，24h）。 |
 | `daily.time2` | string | `""` | 每日触发时间 2（`HH:MM`）。若与 `time1` 相同会自动 **+1 分钟** 错峰。 |
 | `quiet_hours` | string | `""` | 免打扰时段（`HH:MM-HH:MM`），支持跨天。免打扰内不主动触发。 |
@@ -146,8 +166,8 @@ AstrBot/
 
    **方式A：使用命令**（在会话中发送）
    ```
-   /conversa on  (或 /cvs on)
-   /conversa watch (或 /cvs watch)
+   /conversa on
+   /conversa watch
    ```
    
    **方式B：在 WebUI 配置** ⭐ 推荐
@@ -159,8 +179,8 @@ AstrBot/
 2. 设定触发方式（在 WebUI 或使用命令）：
 
 - **间隔触发**：
-  - WebUI: 找到 `after_last_msg_minutes` 设置一个大于0的分钟数。
-  - 命令: ` /conversa set after 30 `
+  - WebUI: 找到 `idle_after_minutes` 设置延时基准时间。
+  - 命令: `/conversa set after 0.75` (设置45分钟后触发)
 
 - **每日触发**：
   - WebUI: 找到 `daily_prompts`，设置 `time1`, `time2`, `time3` 的时间 (HH:MM)，并修改对应的提示词。
@@ -180,20 +200,21 @@ AstrBot/
 
 ---
 
-## 💬 指令全集 (`/conversa` 或 `/cvs`)
+## 💬 指令全集 (`/conversa`)
 
 - 基础
-  - `/conversa on` / `/conversa off` — 启用/停用
+  - `/conversa help` — 显示帮助信息
+  - `/conversa debug` — 显示调试信息
+  - `/conversa on` / `/conversa off` — (管理员)启用/停用插件
   - `/conversa watch` / `/conversa unwatch` — 订阅/退订当前会话
-  - `/conversa show` — 查看当前会话订阅状态与核心配置摘要
 - 触发设置
-  - `/conversa set after <分钟>` — 设置“最后消息后 N 分钟触发”；设为 `0` 可关闭
-  - `/conversa set daily[1-3] <HH:MM>` — 设置每日触发时间 1/2/3
-  - `/conversa set quiet <HH:MM-HH:MM>` — 设置免打扰时段（可跨天）
-  - `/conversa set history <N>` — 设置携带最近聊天条数
+  - `/conversa set after <小时>` — 设置专属延时问候时间（最低0.5小时）
+  - `/conversa set daily[1-3] <HH:MM>` — (管理员)设置每日触发时间 1/2/3
+  - `/conversa set quiet <HH:MM-HH:MM>` — (管理员)设置免打扰时段（可跨天）
+  - `/conversa set history <N>` — (管理员)设置携带最近聊天条数
 - 提醒
   - `/conversa remind add <YYYY-MM-DD HH:MM> <内容>` — 新增**一次性**提醒
-  - `/conversa remind add <HH:MM> <内容> daily` — 新增**每日**提醒
+  - `/conversa remind add <HH:MM> <内容>` — 新增**每日**提醒
   - `/conversa remind list` — 查看提醒列表
   - `/conversa remind del <ID>` — 删除提醒
 
@@ -207,7 +228,7 @@ AstrBot/
   3. 对每个**已订阅**会话：
      - 若当前处于免打扰，跳过。
      - 检查是否需要自动退订（用户超过指定天数未回复）。
-     - 若距离最后消息已超过 `after_last_msg_minutes`，触发"间隔续聊"。
+     - 若距离最后消息已超过用户设定的延时时间，触发"间隔续聊"。
      - 若当前分钟命中 `daily.time1/time2`，触发"每日续聊"。
      - 利用"上次触发标签"去重（同一分钟不重复）。
   4. 扫描**提醒**：到点后调用 **AI 生成提醒内容**并发送；每日提醒按 HH:MM 命中即发。
@@ -252,16 +273,17 @@ AstrBot/
 
 ## 📄 示例
 
-**设置"最后消息后 45 分钟续聊"，每日 09:00/20:00 提醒关心**
+**设置"45分钟延时问候"，每日 09:00/20:00 定时问候**
 
 ```
 /conversa on
 /conversa watch
-/conversa set after 45
+/conversa set after 0.75
 /conversa set daily1 09:00
 /conversa set daily2 20:00
-/conversa prompt add 你是温柔体贴的生活助理，请在不打扰的前提下继续话题，并给一个可执行的小建议。
 ```
+
+**注意**：提示词模板需要在 WebUI 的 `idle_prompt_templates` 和 `daily_prompts` 中配置。
 
 **添加提醒**
 
@@ -292,7 +314,7 @@ AstrBot/
 
 ## 🧾 版本信息
 
-**当前版本：v1.1.0** ⭐
+**当前版本：v1.2.0** ⭐
 
 ### v1.0.0 主要特性
 
