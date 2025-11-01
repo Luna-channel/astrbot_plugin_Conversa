@@ -563,13 +563,32 @@ class Conversa(Star):
                 return
             
             if remind_sub_command == "del" and len(args) >= 3:
-                rid = args[2].strip()
-                if rid in self._reminders and self._reminders[rid].umo == event.unified_msg_origin:
-                    del self._reminders[rid]
-                    self._save_user_data()
-                    yield reply(f"🗑️ 已删除提醒 {rid}")
-                else:
-                    yield reply("未找到该提醒 ID")
+                # 支持通过序号或 ID 删除
+                identifier = args[2].strip()
+                umo = event.unified_msg_origin
+                
+                # 尝试解析为序号（整数）
+                try:
+                    index = int(identifier)
+                    # 获取用户的提醒列表并排序
+                    user_reminders = self._get_user_reminders_sorted(umo)
+                    if 1 <= index <= len(user_reminders):
+                        rid = user_reminders[index - 1].id  # 序号从 1 开始
+                        del self._reminders[rid]
+                        self._save_user_data()
+                        yield reply(f"🗑️ 已删除提醒 #{index}")
+                    else:
+                        yield reply(f"❌ 序号超出范围，当前共有 {len(user_reminders)} 个提醒")
+                    return
+                except ValueError:
+                    # 不是数字，尝试作为 ID 删除（向后兼容）
+                    rid = identifier
+                    if rid in self._reminders and self._reminders[rid].umo == umo:
+                        del self._reminders[rid]
+                        self._save_user_data()
+                        yield reply(f"🗑️ 已删除提醒 {rid}")
+                    else:
+                        yield reply("❌ 未找到该提醒，请使用 `/conversa remind list` 查看可用序号")
                 return
             
             if remind_sub_command == "add":
@@ -622,17 +641,27 @@ class Conversa(Star):
             "/conversa set after <小时> - x小时后主动问候（最低0.5）\n"
             "/conversa remind <add/list/del> [参数...]\n"
             "  - add <HH:MM> <提醒内容> - 添加一个每日提醒，可以直接使用自然语言，如：提醒我早睡\n"
-            "  - list - 显示当前会话的所有提醒\n"
-            "  - del <编号> - 删除指定编号的提醒"
+            "  - list - 显示当前会话的所有提醒（显示序号）\n"
+            "  - del <序号> - 删除指定序号的提醒（如：del 1）"
         )
 
-    def _remind_list_text(self, umo: str) -> str:
-        """生成指定用户的提醒列表文本"""
+    def _get_user_reminders_sorted(self, umo: str) -> List[Reminder]:
+        """获取指定用户的提醒列表并排序"""
         arr = [r for r in self._reminders.values() if r.umo == umo]
+        arr.sort(key=lambda x: x.created_at)
+        return arr
+    
+    def _remind_list_text(self, umo: str) -> str:
+        """生成指定用户的提醒列表文本（显示序号）"""
+        arr = self._get_user_reminders_sorted(umo)
         if not arr:
             return "暂无提醒"
-        arr.sort(key=lambda x: x.created_at)
-        return "提醒列表：\n" + "\n".join(f"{r.id} | {r.at} | {r.content}" for r in arr)
+        lines = []
+        for idx, r in enumerate(arr, start=1):
+            # 格式化时间显示
+            time_display = r.at.replace("|daily", " (每日)")
+            lines.append(f"{idx}. {time_display} | {r.content}")
+        return "提醒列表(删除会改变序号): \n" + "\n".join(lines)
 
     # 调度器
     
@@ -902,8 +931,7 @@ class Conversa(Star):
             # 记录关键信息
             logger.info(f"[Conversa] 准备主动回复 {umo}，上下文: {len(contexts)}条，系统提示词: {'已获取' if system_prompt else '空'}")
             
-            # 框架会自动将 prompt 作为 user 消息、completion_text 作为 assistant 消息加入历史
-            # 不需要手动添加模拟消息，完全依赖框架的自动处理
+            # 调用 LLM 生成回复
             llm_resp = await provider.text_chat(
                 prompt=prompt,
                 contexts=contexts,
@@ -914,13 +942,17 @@ class Conversa(Star):
             if not text.strip():
                 return False
             
-            # 添加时间戳
+            # 添加时间戳（在存档到历史之前，保存原始文本用于发送）
+            response_text = text
             if bool(self._get_cfg("basic_settings", "append_time_field")):
-                text = f"[{_fmt_now(self._get_cfg('basic_settings', 'time_format') or '%Y-%m-%d %H:%M', tz)}] " + text
+                response_text = f"[{_fmt_now(self._get_cfg('basic_settings', 'time_format') or '%Y-%m-%d %H:%M', tz)}] " + text
+            
+            # 手动将模拟的用户 prompt 和 AI 回复添加到对话历史
+            await self._add_message_pair_to_history(umo, curr_cid, conversation, prompt, response_text)
             
             # 发送消息
-            await self._send_text(umo, text)
-            logger.info(f"[Conversa] 已发送主动回复给 {umo}: {text[:50]}...")
+            await self._send_text(umo, response_text)
+            logger.info(f"[Conversa] 已发送主动回复给 {umo}: {response_text[:50]}...")
             
             # 更新状态
             now_ts = _now_tz(tz).timestamp()
@@ -973,7 +1005,7 @@ class Conversa(Star):
 
             logger.info(f"[Conversa] 触发 AI 提醒 for {umo}: {reminder_content}")
 
-            # 框架会自动将 prompt 作为 user 消息、completion_text 作为 assistant 消息加入历史
+            # 调用 LLM 生成提醒回复
             llm_resp = await provider.text_chat(
                 prompt=prompt,
                 contexts=contexts,
@@ -984,7 +1016,10 @@ class Conversa(Star):
             if not text.strip():
                 return False
 
-            # 发送提醒消息（使用专门的模拟用户消息）
+            # 手动将模拟的用户 prompt 和 AI 回复添加到对话历史
+            await self._add_message_pair_to_history(umo, curr_cid, conversation, prompt, text)
+
+            # 发送提醒消息
             await self._send_reminder_message(umo, text)
             logger.info(f"[Conversa] 已发送 AI 提醒给 {umo}: {text[:50]}...")
             return True
@@ -992,6 +1027,69 @@ class Conversa(Star):
         except Exception as e:
             logger.error(f"[Conversa] proactive reminder error({umo}): {e}")
             return False
+
+    async def _add_message_pair_to_history(self, umo: str, conversation_id: str, conversation, user_prompt: str, assistant_response: str):
+        """
+        手动将模拟的用户 prompt 和 AI 回复添加到对话历史
+        
+        根据 GitHub issue #3216 的解决方案：
+        - 需要同时将"模拟的用户 Prompt"和"AI的回复"作为一个完整的 user -> assistant 对
+        - 一起追加到 history 列表的末尾，然后再调用 update_conversation
+        """
+        try:
+            # 获取当前历史记录
+            current_history = []
+            
+            # 尝试从 conversation 对象获取历史
+            if conversation:
+                # 尝试多种可能的属性
+                history_data = None
+                if hasattr(conversation, "history"):
+                    history_data = conversation.history
+                elif hasattr(conversation, "messages"):
+                    history_data = conversation.messages
+                
+                # 如果是字符串（JSON），解析它
+                if isinstance(history_data, str):
+                    try:
+                        current_history = json.loads(history_data)
+                    except json.JSONDecodeError:
+                        logger.warning(f"[Conversa] 无法解析 history JSON: {history_data[:100] if history_data else 'None'}")
+                        current_history = []
+                # 如果是列表，直接使用
+                elif isinstance(history_data, list):
+                    current_history = history_data.copy()
+                # 如果不存在，尝试通过 _safe_get_full_contexts 获取
+                else:
+                    contexts = await self._safe_get_full_contexts(umo, conversation)
+                    if contexts:
+                        current_history = contexts.copy()
+            
+            # 确保 current_history 是列表
+            if not isinstance(current_history, list):
+                current_history = []
+            
+            # 1. 存档我们模拟的 "user" 消息
+            user_record = {"role": "user", "content": user_prompt}
+            current_history.append(user_record)
+            
+            # 2. 存档 AI 生成的 "assistant" 消息
+            assistant_record = {"role": "assistant", "content": assistant_response}
+            current_history.append(assistant_record)
+            
+            # 3. 将包含了完整"一问一答"的新历史，写回数据库
+            conv_mgr = self.context.conversation_manager
+            await conv_mgr.update_conversation(
+                session_id=umo,
+                conversation_id=conversation_id,
+                history=current_history
+            )
+            
+            logger.info(f"[Conversa] ✅ 已将主动回复添加到历史：user({len(user_prompt)}字符) + assistant({len(assistant_response)}字符)")
+            
+        except Exception as e:
+            logger.error(f"[Conversa] ❌ 添加消息对到历史失败: {e}")
+            # 不抛出异常，允许继续执行发送消息的操作
 
     async def _get_system_prompt(self, umo: str, conversation) -> str:
         """获取系统提示词，支持配置覆盖和降级策略"""
