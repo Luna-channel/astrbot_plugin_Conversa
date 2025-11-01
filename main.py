@@ -661,7 +661,9 @@ class Conversa(Star):
             # 格式化时间显示
             time_display = r.at.replace("|daily", " (每日)")
             lines.append(f"{idx}. {time_display} | {r.content}")
-        return "提醒列表(删除会改变序号): \n" + "\n".join(lines)
+        # 使用换行符连接，确保每个提醒单独一行
+        # 提示信息放在末尾，避免某些消息平台过滤括号内容
+        return "提醒列表：\n" + "\n".join(lines)
 
     # 调度器
     
@@ -1037,36 +1039,33 @@ class Conversa(Star):
         - 一起追加到 history 列表的末尾，然后再调用 update_conversation
         """
         try:
-            # 获取当前历史记录
+            # 检查 conversation_id 是否有效
+            if not conversation_id:
+                logger.warning("[Conversa] conversation_id 为空，无法更新历史")
+                return
+            
+            # 重新获取 conversation 以确保获取最新状态
+            conv_mgr = self.context.conversation_manager
+            conversation = await conv_mgr.get_conversation(umo, conversation_id)
+            if not conversation:
+                logger.warning("[Conversa] 无法获取 conversation 对象")
+                return
+            
+            # 参考 issue反馈的解决方案：直接使用 conversation.history（JSON字符串）
             current_history = []
-            
-            # 尝试从 conversation 对象获取历史
-            if conversation:
-                # 尝试多种可能的属性
-                history_data = None
-                if hasattr(conversation, "history"):
-                    history_data = conversation.history
-                elif hasattr(conversation, "messages"):
-                    history_data = conversation.messages
-                
-                # 如果是字符串（JSON），解析它
-                if isinstance(history_data, str):
-                    try:
-                        current_history = json.loads(history_data)
-                    except json.JSONDecodeError:
-                        logger.warning(f"[Conversa] 无法解析 history JSON: {history_data[:100] if history_data else 'None'}")
+            if hasattr(conversation, "history") and conversation.history:
+                try:
+                    # conversation.history 是 JSON 字符串，需要解析
+                    current_history = json.loads(conversation.history)
+                    if not isinstance(current_history, list):
+                        logger.warning("[Conversa] 解析后的 history 不是列表格式")
                         current_history = []
-                # 如果是列表，直接使用
-                elif isinstance(history_data, list):
-                    current_history = history_data.copy()
-                # 如果不存在，尝试通过 _safe_get_full_contexts 获取
-                else:
-                    contexts = await self._safe_get_full_contexts(umo, conversation)
-                    if contexts:
-                        current_history = contexts.copy()
-            
-            # 确保 current_history 是列表
-            if not isinstance(current_history, list):
+                    logger.info(f"[Conversa] 从 conversation.history 获取到 {len(current_history)} 条历史记录")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"[Conversa] 无法解析 history JSON: {e}")
+                    current_history = []
+            else:
+                logger.info("[Conversa] conversation.history 为空，将创建新历史")
                 current_history = []
             
             # 1. 存档我们模拟的 "user" 消息
@@ -1077,18 +1076,20 @@ class Conversa(Star):
             assistant_record = {"role": "assistant", "content": assistant_response}
             current_history.append(assistant_record)
             
+            logger.info(f"[Conversa] 准备更新历史，当前历史记录数: {len(current_history)}")
+            
             # 3. 将包含了完整"一问一答"的新历史，写回数据库
-            conv_mgr = self.context.conversation_manager
+            # 根据官方文档：update_conversation(unified_msg_origin, conversation_id, history, title, persona_id)
             await conv_mgr.update_conversation(
-                session_id=umo,
+                unified_msg_origin=umo,
                 conversation_id=conversation_id,
                 history=current_history
             )
             
-            logger.info(f"[Conversa] ✅ 已将主动回复添加到历史：user({len(user_prompt)}字符) + assistant({len(assistant_response)}字符)")
+            logger.info(f"[Conversa] ✅ 已将主动回复添加到历史：user({len(user_prompt)}字符) + assistant({len(assistant_response)}字符)，总记录数: {len(current_history)}")
             
         except Exception as e:
-            logger.error(f"[Conversa] ❌ 添加消息对到历史失败: {e}")
+            logger.error(f"[Conversa] ❌ 添加消息对到历史失败: {e}", exc_info=True)
             # 不抛出异常，允许继续执行发送消息的操作
 
     async def _get_system_prompt(self, umo: str, conversation) -> str:
