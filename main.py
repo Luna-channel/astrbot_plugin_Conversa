@@ -150,7 +150,7 @@ class Reminder:
 
 # 主插件类
 
-@register("Conversa", "柯尔", "AI 定时主动续聊 · 支持人格与上下文记忆", "1.2.0", 
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.2.0", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
