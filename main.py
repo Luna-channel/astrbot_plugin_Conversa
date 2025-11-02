@@ -573,12 +573,29 @@ class Conversa(Star):
                     self._user_profiles[umo] = UserProfile()
                     profile = self._user_profiles[umo]
                 
+                # 确保状态存在
+                if umo not in self._states:
+                    self._states[umo] = SessionState()
+                st = self._states[umo]
+                
                 try:
                     hours = float(value)
                     if hours >= 0.5:
                         minutes = int(hours * 60)
                         profile.idle_after_minutes = minutes
+                        
+                        # 立即重新计算 next_idle_ts，使设置立即生效
+                        try:
+                            if profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
+                                tz = self._get_cfg("basic_settings", "timezone") or None
+                                now_ts = _now_tz(tz).timestamp()
+                                st.next_idle_ts = now_ts + minutes * 60
+                                logger.info(f"[Conversa] 已更新 next_idle_ts: {st.next_idle_ts} (距离现在 {minutes} 分钟)")
+                        except Exception as e:
+                            logger.warning(f"[Conversa] 更新 next_idle_ts 失败: {e}")
+                        
                         self._save_user_data()
+                        await self._debounced_save_session_data()
                         yield reply(f"⏱️ 已为您设置专属延时问候：{hours} 小时后触发")
                     else:
                         yield reply("⏱️ 延时问候的小时数不能少于 0.5 (30分钟)。")
