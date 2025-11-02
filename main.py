@@ -14,6 +14,13 @@ from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 
+# 尝试导入 StarTools（如果可用）
+try:
+    from astrbot.api.star import StarTools
+    HAS_STARTOOLS = True
+except ImportError:
+    HAS_STARTOOLS = False
+
 # 工具函数
 def _ensure_dir(p: str) -> str:
     """确保目录存在，不存在则创建"""
@@ -26,9 +33,18 @@ def _now_tz(tz_name: str | None) -> datetime:
     try:
         if tz_name:
             import zoneinfo
+            try:
+                return datetime.now(zoneinfo.ZoneInfo(tz_name))
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:
+                logger.warning(f"[Conversa] 无效时区 '{tz_name}': {e}，使用系统默认时区")
+                return datetime.now()
+    except ImportError:
+        # Python < 3.9 需要 backports.zoneinfo
+        try:
+            from backports import zoneinfo
             return datetime.now(zoneinfo.ZoneInfo(tz_name))
-    except Exception:
-        pass
+        except Exception:
+            pass
     return datetime.now()
 
 
@@ -165,9 +181,33 @@ class Conversa(Star):
         self._user_profiles: Dict[str, UserProfile] = {}
         self._reminders: Dict[str, Reminder] = {}
         
-        # 数据文件路径
-        root = os.getcwd()
-        self._data_dir = _ensure_dir(os.path.join(root, "data", "plugin_data", "astrbot_plugin_conversa"))
+        # 数据文件路径（使用规范的方式获取插件数据目录）
+        if HAS_STARTOOLS:
+            # 使用 StarTools 获取规范的数据目录
+            data_dir_path = StarTools.get_data_dir() / "astrbot_plugin_conversa"
+            self._data_dir = str(data_dir_path)
+            os.makedirs(self._data_dir, exist_ok=True)
+        else:
+            # 后备方案：使用更可靠的方式获取数据目录
+            # 尝试从 context 获取，如果不可用则使用当前文件的相对路径
+            try:
+                # 尝试使用 context 获取数据路径
+                if hasattr(context, 'get_data_path') or hasattr(self, 'get_data_path'):
+                    data_path_func = getattr(context, 'get_data_path', None) or getattr(self, 'get_data_path', None)
+                    if data_path_func:
+                        base_path = data_path_func()
+                        self._data_dir = _ensure_dir(os.path.join(base_path, "astrbot_plugin_conversa"))
+                    else:
+                        raise AttributeError
+                else:
+                    raise AttributeError
+            except (AttributeError, TypeError):
+                # 最终后备：基于当前工作目录，但添加警告
+                import warnings
+                warnings.warn("[Conversa] 无法使用 StarTools，使用 os.getcwd() 作为后备方案")
+                root = os.getcwd()
+                self._data_dir = _ensure_dir(os.path.join(root, "data", "plugin_data", "astrbot_plugin_conversa"))
+        
         self._user_data_path = os.path.join(self._data_dir, "user_data.json")
         self._session_data_path = os.path.join(self._data_dir, "session_data.json")
         
@@ -209,6 +249,8 @@ class Conversa(Star):
         
         except (json.JSONDecodeError, TypeError) as e:
             logger.error(f"[Conversa] Failed to load user data: {e}")
+        except (IOError, OSError) as e:
+            logger.error(f"[Conversa] Failed to read user data file: {e}")
     
     def _save_user_data(self):
         """保存用户配置和提醒事项（到 user_data.json）"""
@@ -221,8 +263,10 @@ class Conversa(Star):
             }
             with open(self._user_data_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            logger.error(f"[Conversa] Failed to save user data: {e}")
+        except (IOError, OSError) as e:
+            logger.error(f"[Conversa] Failed to write user data file: {e}")
+        except (TypeError, ValueError) as e:
+            logger.error(f"[Conversa] Failed to serialize user data: {e}")
     
     def _load_session_data(self):
         """加载运行时状态（从 session_data.json）"""
@@ -239,6 +283,8 @@ class Conversa(Star):
         
         except (json.JSONDecodeError, TypeError) as e:
             logger.error(f"[Conversa] Failed to load session data: {e}")
+        except (IOError, OSError) as e:
+            logger.error(f"[Conversa] Failed to read session data file: {e}")
     
     def _save_session_data(self):
         """保存运行时状态（到 session_data.json）"""
@@ -247,8 +293,10 @@ class Conversa(Star):
             data = {"states": states_dict}
             with open(self._session_data_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            logger.error(f"[Conversa] Failed to save session data: {e}")
+        except (IOError, OSError) as e:
+            logger.error(f"[Conversa] Failed to write session data file: {e}")
+        except (TypeError, ValueError) as e:
+            logger.error(f"[Conversa] Failed to serialize session data: {e}")
     
     def _sync_subscribed_users_from_config(self):
         """从配置文件同步订阅用户列表到内部状态"""
@@ -385,7 +433,6 @@ class Conversa(Star):
             return
         
         # 提取真实命令和参数
-        triggered_command = command_parts[0].lower()
         args_str = " ".join(command_parts[1:]) if len(command_parts) > 1 else ""
         
         # 将参数字符串分割成子命令和值
@@ -698,19 +745,8 @@ class Conversa(Star):
         hist_n = int(self._get_cfg("basic_settings", "history_depth") or 8)
         reply_interval = int(self._get_cfg("basic_settings", "reply_interval_seconds") or 10)
 
-        # 解析每日定时配置
-        daily = self.cfg.get("daily_prompts") or {}
-        t1 = _parse_hhmm(str(daily.get("time1", "") or "")) if bool(daily.get("daily1_enable", True)) else None
-        t2 = _parse_hhmm(str(daily.get("time2", "") or "")) if bool(daily.get("daily2_enable", True)) else None
-        t3 = _parse_hhmm(str(daily.get("time3", "") or "")) if bool(daily.get("daily3_enable", True)) else None
-        
-        times = {t for t in (t1, t2, t3) if t}
-        unique_times = sorted(list(times))
-        t1, t2, t3 = (unique_times + [None, None, None])[:3]
-
-        curr_min_tag_1 = f"daily1@{now.strftime('%Y-%m-%d')} {t1[0]:02d}:{t1[1]:02d}" if t1 else ""
-        curr_min_tag_2 = f"daily2@{now.strftime('%Y-%m-%d')} {t2[0]:02d}:{t2[1]:02d}" if t2 else ""
-        curr_min_tag_3 = f"daily3@{now.strftime('%Y-%m-%d')} {t3[0]:02d}:{t3[1]:02d}" if t3 else ""
+        # 解析每日定时配置（修复：使用 slot1/slot2/slot3 而非 time1/time2/time3）
+        daily_slots = self._parse_daily_slots(now)
 
         # 遍历所有已订阅用户
         for umo, profile in list(self._user_profiles.items()):
@@ -724,72 +760,111 @@ class Conversa(Star):
             if st and await self._should_auto_unsubscribe(umo, profile, st, now):
                 continue
 
-            # 延时问候
-            if bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
-                if st and st.next_idle_ts and now.timestamp() >= st.next_idle_ts:
-                    tag = f"idle@{now.strftime('%Y-%m-%d %H:%M')}"
-                    if st.last_fired_tag != tag:
-                        idle_prompts = self._get_cfg("idle_greetings", "idle_prompt_templates") or []
-                        if idle_prompts:
-                            prompt_template = random.choice(idle_prompts)
-                            logger.info(f"[Conversa] 触发延时问候 {umo}")
-                            ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
-                            if ok:
-                                st.last_fired_tag = tag
-                                st.next_idle_ts = 0.0
-                                if reply_interval > 0:
-                                    await asyncio.sleep(reply_interval)
-                            else:
-                                st.consecutive_no_reply_count += 1
+            # 检查延时问候
+            await self._check_idle_greeting(umo, st, now, hist_n, tz, reply_interval)
 
-            # 每日定时1
-            if bool(self.cfg.get("enable_daily_greetings", True)) and profile.daily_reminders_enabled:
-                if st and t1 and now.hour == t1[0] and now.minute == t1[1]:
-                    if st.last_fired_tag != curr_min_tag_1:
-                        prompt_template = daily.get("prompt1")
-                        if prompt_template:
-                            logger.info(f"[Conversa] 触发每日定时1回复 {umo}")
-                            ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
-                            if ok:
-                                st.last_fired_tag = curr_min_tag_1
-                                if reply_interval > 0:
-                                    await asyncio.sleep(reply_interval)
-                            else:
-                                st.consecutive_no_reply_count += 1
-                        
-            # 每日定时2
-            if bool(self.cfg.get("enable_daily_greetings", True)) and profile.daily_reminders_enabled:
-                if st and t2 and now.hour == t2[0] and now.minute == t2[1]:
-                    if st.last_fired_tag != curr_min_tag_2:
-                        prompt_template = daily.get("prompt2")
-                        if prompt_template:
-                            logger.info(f"[Conversa] 触发每日定时2回复 {umo}")
-                            ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
-                            if ok:
-                                st.last_fired_tag = curr_min_tag_2
-                                if reply_interval > 0:
-                                    await asyncio.sleep(reply_interval)
-                            else:
-                                st.consecutive_no_reply_count += 1
-
-            # 每日定时3
-            if bool(self.cfg.get("enable_daily_greetings", True)) and profile.daily_reminders_enabled:
-                if st and t3 and now.hour == t3[0] and now.minute == t3[1]:
-                    if st.last_fired_tag != curr_min_tag_3:
-                        prompt_template = daily.get("prompt3")
-                        if prompt_template:
-                            logger.info(f"[Conversa] 触发每日定时3回复 {umo}")
-                            ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
-                            if ok:
-                                st.last_fired_tag = curr_min_tag_3
-                                if reply_interval > 0:
-                                    await asyncio.sleep(reply_interval)
-                            else:
-                                st.consecutive_no_reply_count += 1
+            # 检查每日定时问候
+            await self._check_daily_greetings(umo, st, profile, now, daily_slots, hist_n, tz, reply_interval)
 
         # 检查提醒
         await self._check_reminders(now, tz, reply_interval)
         self._save_session_data()
+
+    def _parse_daily_slots(self, now: datetime) -> List[Tuple[int, Optional[Tuple[int, int]], str, dict]]:
+        """
+        解析每日定时配置，返回槽位信息列表
+        
+        支持两种配置结构：
+        1. 扁平结构（WebUI）: time1, prompt1, daily1_enable
+        2. 嵌套结构（命令）: slot1.time, slot1.prompt, slot1.enable
+        
+        返回: [(slot_num, time_tuple, tag, slot_cfg), ...]
+        """
+        daily = self.cfg.get("daily_prompts") or {}
+        slots_info = []
+        
+        for slot_num in [1, 2, 3]:
+            # 优先尝试嵌套结构（slot1/slot2/slot3）
+            slot_cfg = daily.get(f"slot{slot_num}", {})
+            if slot_cfg:
+                # 嵌套结构：slot{n}.time, slot{n}.enable, slot{n}.prompt
+                if slot_cfg.get("enable", False):
+                    time_str = slot_cfg.get("time", "")
+                    prompt_str = slot_cfg.get("prompt", "")
+                    time_tuple = _parse_hhmm(time_str)
+                    if time_tuple:
+                        tag = f"daily{slot_num}@{now.strftime('%Y-%m-%d')} {time_tuple[0]:02d}:{time_tuple[1]:02d}"
+                        slots_info.append((slot_num, time_tuple, tag, {"prompt": prompt_str}))
+            else:
+                # 扁平结构：time1, prompt1, daily1_enable
+                enable_key = f"daily{slot_num}_enable"
+                time_key = f"time{slot_num}"
+                prompt_key = f"prompt{slot_num}"
+                
+                if daily.get(enable_key, False):
+                    time_str = daily.get(time_key, "")
+                    prompt_str = daily.get(prompt_key, "")
+                    time_tuple = _parse_hhmm(time_str)
+                    if time_tuple:
+                        tag = f"daily{slot_num}@{now.strftime('%Y-%m-%d')} {time_tuple[0]:02d}:{time_tuple[1]:02d}"
+                        slots_info.append((slot_num, time_tuple, tag, {"prompt": prompt_str}))
+        
+        return slots_info
+
+    async def _check_idle_greeting(self, umo: str, st: Optional[SessionState], now: datetime, 
+                                   hist_n: int, tz: Optional[str], reply_interval: int):
+        """检查并触发延时问候"""
+        if not bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
+            return
+        
+        if not st or not st.next_idle_ts or now.timestamp() < st.next_idle_ts:
+            return
+        
+        tag = f"idle@{now.strftime('%Y-%m-%d %H:%M')}"
+        if st.last_fired_tag == tag:
+            return
+        
+        idle_prompts = self._get_cfg("idle_greetings", "idle_prompt_templates") or []
+        if not idle_prompts:
+            return
+        
+        prompt_template = random.choice(idle_prompts)
+        logger.info(f"[Conversa] 触发延时问候 {umo}")
+        ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
+        if ok:
+            st.last_fired_tag = tag
+            st.next_idle_ts = 0.0
+            if reply_interval > 0:
+                await asyncio.sleep(reply_interval)
+        else:
+            st.consecutive_no_reply_count += 1
+
+    async def _check_daily_greetings(self, umo: str, st: Optional[SessionState], profile: UserProfile,
+                                     now: datetime, daily_slots: List[Tuple], hist_n: int, 
+                                     tz: Optional[str], reply_interval: int):
+        """检查并触发每日定时问候"""
+        if not bool(self.cfg.get("enable_daily_greetings", True)) or not profile.daily_reminders_enabled:
+            return
+        
+        if not st:
+            return
+        
+        for slot_num, slot_time, tag, slot_cfg in daily_slots:
+            if slot_time and now.hour == slot_time[0] and now.minute == slot_time[1]:
+                if st.last_fired_tag == tag:
+                    continue
+                
+                prompt_template = slot_cfg.get("prompt", "")
+                if prompt_template:
+                    logger.info(f"[Conversa] 触发每日定时{slot_num}回复 {umo}")
+                    ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
+                    if ok:
+                        st.last_fired_tag = tag
+                        if reply_interval > 0:
+                            await asyncio.sleep(reply_interval)
+                    else:
+                        st.consecutive_no_reply_count += 1
+                break  # 同一分钟只触发一个定时任务
 
     async def _should_auto_unsubscribe(self, umo: str, profile: UserProfile, st: SessionState, now: datetime) -> bool:
         """检查是否需要自动退订（根据用户无回复天数）"""
@@ -839,20 +914,26 @@ class Conversa(Star):
                                 if reply_interval > 0:
                                     await asyncio.sleep(reply_interval)
                 else:
-                    dt = datetime.strptime(r.at, "%Y-%m-%d %H:%M")
-                    if now.strftime("%Y-%m-%d %H:%M") == dt.strftime("%Y-%m-%d %H:%M"):
-                        # 为一次性提醒创建唯一标记（防止重复），尽管它之后会被删除
-                        tag = f"remind_once_{r.id}@{now.strftime('%Y-%m-%d %H:%M')}"
-                        if st.last_fired_tag != tag:
-                            logger.info(f"[Conversa] Firing one-time reminder {r.id} for {r.umo}")
-                            ok = await self._proactive_reminder_reply(r.umo, r.content)
-                            # 无论发送成功与否，一次性提醒都应该被删除，避免无限重试
-                            st.last_fired_tag = tag
-                            fired_ids.append(rid)
-                            if not ok:
-                                logger.warning(f"[Conversa] One-time reminder {r.id} failed to send, but will be deleted to prevent infinite retry")
-                            if reply_interval > 0:
-                                await asyncio.sleep(reply_interval)
+                    # 修复：使用范围检查而非精确匹配，确保不会错过提醒
+                    try:
+                        dt = datetime.strptime(r.at, "%Y-%m-%d %H:%M")
+                        # 使用 >= 比较，只要当前时间已到达或超过提醒时间就触发
+                        if now >= dt:
+                            # 为一次性提醒创建唯一标记（防止重复），尽管它之后会被删除
+                            tag = f"remind_once_{r.id}@{dt.strftime('%Y-%m-%d %H:%M')}"
+                            if st.last_fired_tag != tag:
+                                logger.info(f"[Conversa] Firing one-time reminder {r.id} for {r.umo} (due: {r.at})")
+                                ok = await self._proactive_reminder_reply(r.umo, r.content)
+                                # 无论发送成功与否，一次性提醒都应该被删除，避免无限重试
+                                st.last_fired_tag = tag
+                                fired_ids.append(rid)
+                                if not ok:
+                                    logger.warning(f"[Conversa] One-time reminder {r.id} failed to send, but will be deleted to prevent infinite retry")
+                                if reply_interval > 0:
+                                    await asyncio.sleep(reply_interval)
+                    except ValueError:
+                        logger.warning(f"[Conversa] Invalid reminder time format: {r.at} for reminder {r.id}")
+                        continue
             except Exception as e:
                 logger.error(f"[Conversa] Error checking reminder {r.id}: {e}")
                 continue
