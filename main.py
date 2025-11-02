@@ -228,7 +228,9 @@ class Conversa(Star):
         return event.role == "admin"
 
     def _get_cfg(self, group_key: str, sub_key: str, default=None):
-        group = self.cfg.get(group_key) or {}
+        group = self.cfg.get(group_key)
+        if not isinstance(group, dict):
+            return default
         return group.get(sub_key, default)
 
     # 数据持久化
@@ -967,7 +969,6 @@ class Conversa(Star):
                     # 修复：使用范围检查而非精确匹配，确保不会错过提醒
                     try:
                         dt = datetime.strptime(r.at, "%Y-%m-%d %H:%M")
-                        dt = dt.replace(tzinfo=now.tzinfo) 
                         # 使用 >= 比较，只要当前时间已到达或超过提醒时间就触发
                         if now >= dt:
                             # 为一次性提醒创建唯一标记（防止重复），尽管它之后会被删除
