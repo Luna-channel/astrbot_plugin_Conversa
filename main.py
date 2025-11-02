@@ -181,6 +181,11 @@ class Conversa(Star):
         self._user_profiles: Dict[str, UserProfile] = {}
         self._reminders: Dict[str, Reminder] = {}
         
+        # 文件保存去抖相关
+        self._save_user_data_task: Optional[asyncio.Task] = None
+        self._save_session_data_task: Optional[asyncio.Task] = None
+        self._save_delay_seconds = 2.0  # 去抖延迟：2秒
+        
         # 数据文件路径（使用规范的方式获取插件数据目录）
         if HAS_STARTOOLS:
             # 使用 StarTools 获取规范的数据目录
@@ -253,7 +258,7 @@ class Conversa(Star):
             logger.error(f"[Conversa] Failed to read user data file: {e}")
     
     def _save_user_data(self):
-        """保存用户配置和提醒事项（到 user_data.json）"""
+        """保存用户配置和提醒事项（到 user_data.json）- 立即保存版本"""
         try:
             profiles_dict = {uid: profile.to_dict() for uid, profile in self._user_profiles.items()}
             reminders_dict = {rid: reminder.to_dict() for rid, reminder in self._reminders.items()}
@@ -267,6 +272,24 @@ class Conversa(Star):
             logger.error(f"[Conversa] Failed to write user data file: {e}")
         except (TypeError, ValueError) as e:
             logger.error(f"[Conversa] Failed to serialize user data: {e}")
+    
+    async def _save_user_data_debounced(self):
+        """保存用户数据（去抖版本）- 延迟保存以减少频繁磁盘 I/O"""
+        # 取消之前的任务（如果存在）
+        if self._save_user_data_task and not self._save_user_data_task.done():
+            self._save_user_data_task.cancel()
+        
+        # 创建新的延迟保存任务
+        async def delayed_save():
+            try:
+                await asyncio.sleep(self._save_delay_seconds)
+                self._save_user_data()
+            except asyncio.CancelledError:
+                pass  # 任务被取消是正常情况
+            except Exception as e:
+                logger.error(f"[Conversa] Debounced save user data error: {e}")
+        
+        self._save_user_data_task = asyncio.create_task(delayed_save())
     
     def _load_session_data(self):
         """加载运行时状态（从 session_data.json）"""
@@ -287,7 +310,7 @@ class Conversa(Star):
             logger.error(f"[Conversa] Failed to read session data file: {e}")
     
     def _save_session_data(self):
-        """保存运行时状态（到 session_data.json）"""
+        """保存运行时状态（到 session_data.json）- 立即保存版本"""
         try:
             states_dict = {cid: state.to_dict() for cid, state in self._states.items()}
             data = {"states": states_dict}
@@ -297,6 +320,24 @@ class Conversa(Star):
             logger.error(f"[Conversa] Failed to write session data file: {e}")
         except (TypeError, ValueError) as e:
             logger.error(f"[Conversa] Failed to serialize session data: {e}")
+    
+    async def _save_session_data_debounced(self):
+        """保存会话数据（去抖版本）- 延迟保存以减少频繁磁盘 I/O"""
+        # 取消之前的任务（如果存在）
+        if self._save_session_data_task and not self._save_session_data_task.done():
+            self._save_session_data_task.cancel()
+        
+        # 创建新的延迟保存任务
+        async def delayed_save():
+            try:
+                await asyncio.sleep(self._save_delay_seconds)
+                self._save_session_data()
+            except asyncio.CancelledError:
+                pass  # 任务被取消是正常情况
+            except Exception as e:
+                logger.error(f"[Conversa] Debounced save session data error: {e}")
+        
+        self._save_session_data_task = asyncio.create_task(delayed_save())
     
     def _sync_subscribed_users_from_config(self):
         """从配置文件同步订阅用户列表到内部状态"""
@@ -392,9 +433,9 @@ class Conversa(Star):
         except Exception as e:
             logger.warning(f"[Conversa] 计算 next_idle_ts 失败: {e}")
 
-        # 保存状态
-        self._save_session_data()
-        self._save_user_data()
+        # 保存状态（使用去抖版本，减少频繁磁盘 I/O）
+        await self._save_session_data_debounced()
+        await self._save_user_data_debounced()
 
     @filter.after_message_sent()
     async def _after_message_sent(self, event: AstrMessageEvent):
@@ -748,27 +789,32 @@ class Conversa(Star):
         # 解析每日定时配置（修复：使用 slot1/slot2/slot3 而非 time1/time2/time3）
         daily_slots = self._parse_daily_slots(now)
 
-        # 遍历所有已订阅用户
+        # 遍历所有已订阅用户（添加错误隔离，防止单个用户错误影响整体调度）
         for umo, profile in list(self._user_profiles.items()):
-            if not profile.subscribed:
-                continue
-            
-            if _in_quiet(now, quiet):
-                continue
+            try:
+                if not profile.subscribed:
+                    continue
+                
+                if _in_quiet(now, quiet):
+                    continue
 
-            st = self._states.get(umo)
-            if st and await self._should_auto_unsubscribe(umo, profile, st, now):
-                continue
+                st = self._states.get(umo)
+                if st and await self._should_auto_unsubscribe(umo, profile, st, now):
+                    continue
 
-            # 检查延时问候
-            await self._check_idle_greeting(umo, st, now, hist_n, tz, reply_interval)
+                # 检查延时问候
+                await self._check_idle_greeting(umo, st, now, hist_n, tz, reply_interval)
 
-            # 检查每日定时问候
-            await self._check_daily_greetings(umo, st, profile, now, daily_slots, hist_n, tz, reply_interval)
+                # 检查每日定时问候
+                await self._check_daily_greetings(umo, st, profile, now, daily_slots, hist_n, tz, reply_interval)
+            except Exception as e:
+                logger.error(f"[Conversa] 处理用户 {umo} 的 tick 任务时发生错误: {e}", exc_info=True)
+                continue  # 继续处理下一个用户
 
         # 检查提醒
         await self._check_reminders(now, tz, reply_interval)
-        self._save_session_data()
+        # 调度循环结束时保存状态（使用去抖版本，减少频繁磁盘 I/O）
+        await self._save_session_data_debounced()
 
     def _parse_daily_slots(self, now: datetime) -> List[Tuple[int, Optional[Tuple[int, int]], str, dict]]:
         """
@@ -834,10 +880,14 @@ class Conversa(Star):
         if ok:
             st.last_fired_tag = tag
             st.next_idle_ts = 0.0
+            # 只有在成功发送消息后，consecutive_no_reply_count 才会在用户不回复时增加
+            # 发送失败不应该增加此计数，因为这不是用户的错
             if reply_interval > 0:
                 await asyncio.sleep(reply_interval)
         else:
-            st.consecutive_no_reply_count += 1
+            # 发送失败不应该增加 consecutive_no_reply_count
+            # 这个计数器只应该在成功发送后、用户长时间不回复时增加
+            logger.warning(f"[Conversa] 延时问候发送失败 {umo}，不增加未回复计数")
 
     async def _check_daily_greetings(self, umo: str, st: Optional[SessionState], profile: UserProfile,
                                      now: datetime, daily_slots: List[Tuple], hist_n: int, 
@@ -860,10 +910,13 @@ class Conversa(Star):
                     ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
                     if ok:
                         st.last_fired_tag = tag
+                        # 只有在成功发送消息后，consecutive_no_reply_count 才会在用户不回复时增加
                         if reply_interval > 0:
                             await asyncio.sleep(reply_interval)
                     else:
-                        st.consecutive_no_reply_count += 1
+                        # 发送失败不应该增加 consecutive_no_reply_count
+                        # 这个计数器只应该在成功发送后、用户长时间不回复时增加
+                        logger.warning(f"[Conversa] 每日定时{slot_num}回复发送失败 {umo}，不增加未回复计数")
                 break  # 同一分钟只触发一个定时任务
 
     async def _should_auto_unsubscribe(self, umo: str, profile: UserProfile, st: SessionState, now: datetime) -> bool:
@@ -1118,6 +1171,16 @@ class Conversa(Star):
         根据 GitHub issue #3216 的解决方案：
         - 需要同时将"模拟的用户 Prompt"和"AI的回复"作为一个完整的 user -> assistant 对
         - 一起追加到 history 列表的末尾，然后再调用 update_conversation
+        
+        ⚠️ 风险警告：
+        此方法直接操作 conversation.history（JSON字符串）和手动调用 update_conversation，
+        强依赖于 AstrBot 框架的内部实现细节。这种方式比较脆弱：
+        1. 如果框架更改了 history 字段的存储格式或结构，此代码将失效
+        2. 如果框架提供了更上层的 API（如 conversation.add_messages(...)），应优先使用
+        3. 建议定期检查框架更新，确保此实现与最新版本兼容
+        
+        当前实现是无奈之举，因为框架尚未提供直接追加消息的稳定 API。
+        如果遇到历史记录相关问题，请先检查 AstrBot 框架版本和 API 变更。
         """
         try:
             # 检查 conversation_id 是否有效
