@@ -110,15 +110,25 @@ class UserProfile:
 class SessionState:
     """运行时会话状态（内存中维护）"""
     last_ts: float = 0.0
-    last_fired_tag: str = ""
+    last_fired_tag: str = ""  # 保留用于向后兼容
+    last_fired_tags: dict = None  # 改为字典：{tag: timestamp}，支持过期清理
     last_user_reply_ts: float = 0.0
     consecutive_no_reply_count: int = 0
     next_idle_ts: float = 0.0
+    
+    def __post_init__(self):
+        """初始化后处理"""
+        if self.last_fired_tags is None:
+            self.last_fired_tags = {}
+            # 迁移旧数据
+            if self.last_fired_tag:
+                self.last_fired_tags[self.last_fired_tag] = _now_tz(None).timestamp()
 
     def to_dict(self):
         return {
             "last_ts": self.last_ts,
-            "last_fired_tag": self.last_fired_tag,
+            "last_fired_tag": self.last_fired_tag,  # 保留用于向后兼容
+            "last_fired_tags": self.last_fired_tags if self.last_fired_tags else {},
             "last_user_reply_ts": self.last_user_reply_ts,
             "consecutive_no_reply_count": self.consecutive_no_reply_count,
             "next_idle_ts": self.next_idle_ts
@@ -126,13 +136,38 @@ class SessionState:
 
     @classmethod
     def from_dict(cls, data: dict):
+        tags_dict = data.get("last_fired_tags", {})
+        if not isinstance(tags_dict, dict):
+            tags_dict = {}
+        
         return cls(
             last_ts=data.get("last_ts", 0.0),
             last_fired_tag=data.get("last_fired_tag", ""),
+            last_fired_tags=tags_dict,
             last_user_reply_ts=data.get("last_user_reply_ts", 0.0),
             consecutive_no_reply_count=data.get("consecutive_no_reply_count", 0),
             next_idle_ts=data.get("next_idle_ts", 0.0)
         )
+    
+    def has_fired(self, tag: str) -> bool:
+        """检查某个标记是否已触发（支持过期清理）"""
+        if not self.last_fired_tags:
+            return False
+        return tag in self.last_fired_tags
+    
+    def mark_fired(self, tag: str):
+        """标记某个事件已触发"""
+        if self.last_fired_tags is None:
+            self.last_fired_tags = {}
+        self.last_fired_tags[tag] = _now_tz(None).timestamp()
+        # 同时更新 last_fired_tag 用于向后兼容
+        self.last_fired_tag = tag
+        
+        # 清理过期标记（保留最近7天的记录）
+        now_ts = _now_tz(None).timestamp()
+        expired_tags = [t for t, ts in self.last_fired_tags.items() if now_ts - ts > 7 * 86400]
+        for t in expired_tags:
+            del self.last_fired_tags[t]
 
 
 @dataclass
@@ -573,26 +608,19 @@ class Conversa(Star):
                     self._user_profiles[umo] = UserProfile()
                     profile = self._user_profiles[umo]
                 
-                # 确保状态存在
-                if umo not in self._states:
-                    self._states[umo] = SessionState()
-                st = self._states[umo]
-                
                 try:
                     hours = float(value)
                     if hours >= 0.5:
                         minutes = int(hours * 60)
                         profile.idle_after_minutes = minutes
                         
-                        # 立即重新计算 next_idle_ts，使设置立即生效
-                        try:
-                            if profile.subscribed and bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
-                                tz = self._get_cfg("basic_settings", "timezone") or None
-                                now_ts = _now_tz(tz).timestamp()
-                                st.next_idle_ts = now_ts + minutes * 60
-                                logger.info(f"[Conversa] 已更新 next_idle_ts: {st.next_idle_ts} (距离现在 {minutes} 分钟)")
-                        except Exception as e:
-                            logger.warning(f"[Conversa] 更新 next_idle_ts 失败: {e}")
+                        # 立即更新 next_idle_ts，使设置立即生效
+                        if umo not in self._states:
+                            self._states[umo] = SessionState()
+                        st = self._states[umo]
+                        tz = self._get_cfg("basic_settings", "timezone") or None
+                        now_ts = _now_tz(tz).timestamp()
+                        st.next_idle_ts = now_ts + minutes * 60
                         
                         self._save_user_data()
                         await self._debounced_save_session_data()
@@ -886,11 +914,32 @@ class Conversa(Star):
         if not bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
             return
         
-        if not st or not st.next_idle_ts or now.timestamp() < st.next_idle_ts:
+        if not st:
+            return
+        
+        # 向后兼容：如果 next_idle_ts 未设置或为0，自动初始化
+        if not st.next_idle_ts or st.next_idle_ts <= 0:
+            profile = self._user_profiles.get(umo)
+            if profile and profile.subscribed:
+                delay_m = profile.idle_after_minutes
+                if delay_m is None:
+                    base_delay_m = int(self._get_cfg("idle_greetings", "idle_after_minutes") or 45)
+                    fluctuation_m = int(self._get_cfg("idle_greetings", "idle_random_fluctuation_minutes") or 15)
+                    delay_m = base_delay_m + random.randint(-fluctuation_m, fluctuation_m)
+                    delay_m = max(30, delay_m)
+                
+                # 基于最后活跃时间计算
+                base_ts = st.last_ts if st.last_ts > 0 else now.timestamp()
+                st.next_idle_ts = base_ts + delay_m * 60
+                logger.info(f"[Conversa] 向后兼容：为 {umo} 初始化 next_idle_ts = {st.next_idle_ts}")
+                await self._debounced_save_session_data()
+                return  # 本次不触发，等下次检查
+        
+        if now.timestamp() < st.next_idle_ts:
             return
         
         tag = f"idle@{now.strftime('%Y-%m-%d %H:%M')}"
-        if st.last_fired_tag == tag:
+        if st.has_fired(tag):
             return
         
         idle_prompts = self._get_cfg("idle_greetings", "idle_prompt_templates") or []
@@ -901,7 +950,7 @@ class Conversa(Star):
         logger.info(f"[Conversa] 触发延时问候 {umo}")
         ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
         if ok:
-            st.last_fired_tag = tag
+            st.mark_fired(tag)
             st.next_idle_ts = 0.0
             if reply_interval > 0:
                 await asyncio.sleep(reply_interval)
@@ -920,7 +969,7 @@ class Conversa(Star):
         
         for slot_num, slot_time, tag, slot_cfg in daily_slots:
             if slot_time and now.hour == slot_time[0] and now.minute == slot_time[1]:
-                if st.last_fired_tag == tag:
+                if st.has_fired(tag):
                     continue
                 
                 prompt_template = slot_cfg.get("prompt", "")
@@ -928,7 +977,7 @@ class Conversa(Star):
                     logger.info(f"[Conversa] 触发每日定时{slot_num}回复 {umo}")
                     ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
                     if ok:
-                        st.last_fired_tag = tag
+                        st.mark_fired(tag)
                         if reply_interval > 0:
                             await asyncio.sleep(reply_interval)
                     else:
@@ -975,11 +1024,11 @@ class Conversa(Star):
                     if now.hour == t[0] and now.minute == t[1]:
                         # 为每日提醒创建唯一标记（每天一个）
                         tag = f"remind_daily_{r.id}@{now.strftime('%Y-%m-%d')}"
-                        if st.last_fired_tag != tag:
+                        if not st.has_fired(tag):
                             logger.info(f"[Conversa] Firing daily reminder {r.id} for {r.umo}")
                             ok = await self._proactive_reminder_reply(r.umo, r.content)
                             if ok:
-                                st.last_fired_tag = tag  # 记录已触发
+                                st.mark_fired(tag)  # 记录已触发
                                 if reply_interval > 0:
                                     await asyncio.sleep(reply_interval)
                 else:
@@ -990,11 +1039,11 @@ class Conversa(Star):
                         if now >= dt:
                             # 为一次性提醒创建唯一标记（防止重复），尽管它之后会被删除
                             tag = f"remind_once_{r.id}@{dt.strftime('%Y-%m-%d %H:%M')}"
-                            if st.last_fired_tag != tag:
+                            if not st.has_fired(tag):
                                 logger.info(f"[Conversa] Firing one-time reminder {r.id} for {r.umo} (due: {r.at})")
                                 ok = await self._proactive_reminder_reply(r.umo, r.content)
                                 # 无论发送成功与否，一次性提醒都应该被删除，避免无限重试
-                                st.last_fired_tag = tag
+                                st.mark_fired(tag)
                                 fired_ids.append(rid)
                                 if not ok:
                                     logger.warning(f"[Conversa] One-time reminder {r.id} failed to send, but will be deleted to prevent infinite retry")
