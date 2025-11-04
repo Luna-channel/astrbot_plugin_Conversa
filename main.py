@@ -1032,15 +1032,18 @@ class Conversa(Star):
                                 if reply_interval > 0:
                                     await asyncio.sleep(reply_interval)
                 else:
-                    # 修复：使用范围检查而非精确匹配，确保不会错过提醒
+                    # 一次性提醒：比较时间字符串（精确到分钟）
                     try:
-                        dt = datetime.strptime(r.at, "%Y-%m-%d %H:%M")
-                        # 使用 >= 比较，只要当前时间已到达或超过提醒时间就触发
-                        if now >= dt:
-                            # 为一次性提醒创建唯一标记（防止重复），尽管它之后会被删除
-                            tag = f"remind_once_{r.id}@{dt.strftime('%Y-%m-%d %H:%M')}"
+                        # 使用字符串比较，避免时区问题
+                        reminder_time_str = r.at  # 格式: "YYYY-MM-DD HH:MM"
+                        now_time_str = now.strftime("%Y-%m-%d %H:%M")
+                        
+                        # 使用字符串比较，当前时间 >= 提醒时间即触发
+                        if now_time_str >= reminder_time_str:
+                            # 为一次性提醒创建唯一标记（防止重复）
+                            tag = f"remind_once_{r.id}@{reminder_time_str}"
                             if not st.has_fired(tag):
-                                logger.info(f"[Conversa] Firing one-time reminder {r.id} for {r.umo} (due: {r.at})")
+                                logger.info(f"[Conversa] Firing one-time reminder {r.id} for {r.umo} (due: {r.at}, now: {now_time_str})")
                                 ok = await self._proactive_reminder_reply(r.umo, r.content)
                                 # 无论发送成功与否，一次性提醒都应该被删除，避免无限重试
                                 st.mark_fired(tag)
@@ -1049,8 +1052,8 @@ class Conversa(Star):
                                     logger.warning(f"[Conversa] One-time reminder {r.id} failed to send, but will be deleted to prevent infinite retry")
                                 if reply_interval > 0:
                                     await asyncio.sleep(reply_interval)
-                    except ValueError:
-                        logger.warning(f"[Conversa] Invalid reminder time format: {r.at} for reminder {r.id}")
+                    except Exception as e:
+                        logger.warning(f"[Conversa] Error processing one-time reminder {r.id}: {e}")
                         continue
             except Exception as e:
                 logger.error(f"[Conversa] Error checking reminder {r.id}: {e}")
