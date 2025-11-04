@@ -1039,6 +1039,11 @@ class Conversa(Star):
         fired_ids = []
         for rid, r in list(self._reminders.items()):
             try:
+                # 检查用户订阅状态
+                profile = self._user_profiles.get(r.umo)
+                if not profile or not profile.subscribed:
+                    continue
+                
                 st = self._states.get(r.umo)
                 if not st:
                     logger.warning(f"[Conversa] Reminder check skipped for {r.umo}: no session state found.")
