@@ -88,13 +88,15 @@ class UserProfile:
     idle_after_minutes: int | None = None  
     daily_reminders_enabled: bool = True
     daily_reminder_count: int = 3
+    quiet_hours: str | None = None  # 用户专属免打扰时间 "HH:MM-HH:MM"
 
     def to_dict(self):
         return {
             "subscribed": self.subscribed,
             "idle_after_minutes": self.idle_after_minutes,
             "daily_reminders_enabled": self.daily_reminders_enabled,
-            "daily_reminder_count": self.daily_reminder_count
+            "daily_reminder_count": self.daily_reminder_count,
+            "quiet_hours": self.quiet_hours
         }
 
     @classmethod
@@ -103,7 +105,8 @@ class UserProfile:
             subscribed=data.get("subscribed", False),
             idle_after_minutes=data.get("idle_after_minutes"),
             daily_reminders_enabled=data.get("daily_reminders_enabled", True),
-            daily_reminder_count=data.get("daily_reminder_count", 3)
+            daily_reminder_count=data.get("daily_reminder_count", 3),
+            quiet_hours=data.get("quiet_hours")
         )
 
 @dataclass
@@ -199,7 +202,7 @@ class Reminder:
         )
 
 # 主插件类
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.2.0", 
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.3.0", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
@@ -457,6 +460,15 @@ class Conversa(Star):
         # 自动订阅模式
         if (self._get_cfg("basic_settings", "subscribe_mode") or "manual") == "auto":
             profile.subscribed = True
+        
+        # 自动重新激活：如果用户主动聊天，且曾经订阅过（被自动退订），则重新激活
+        if not profile.subscribed and st.last_user_reply_ts > 0:
+            # 检查是否是因为超时被自动退订的（有历史活跃记录）
+            auto_resubscribe = bool(self._get_cfg("basic_settings", "auto_resubscribe", True))
+            if auto_resubscribe:
+                # 用户主动发消息，重新激活订阅
+                profile.subscribed = True
+                logger.info(f"[Conversa] 自动重新激活订阅: {umo} (用户主动聊天)")
 
 
         # 计算下一次延时问候触发时间
@@ -541,9 +553,11 @@ class Conversa(Star):
                 self._states[umo] = SessionState()
             profile = self._user_profiles.get(umo)
             debug_info.append(f"用户订阅状态: {profile.subscribed if profile else False}")
+            debug_info.append(f"用户专属免打扰: {profile.quiet_hours if profile and profile.quiet_hours else '未设置(使用全局)'}")
+            debug_info.append(f"全局免打扰时间: {self._get_cfg('basic_settings', 'quiet_hours', '未设置')}")
             debug_info.append(f"延时基准: {self._get_cfg('idle_greetings', 'idle_after_minutes', 0)}分钟")
-            debug_info.append(f"免打扰时间: {self._get_cfg('basic_settings', 'quiet_hours', '')}")
             debug_info.append(f"最大无回复天数: {self._get_cfg('basic_settings', 'max_no_reply_days', 0)}")
+            debug_info.append(f"自动重新激活: {bool(self._get_cfg('basic_settings', 'auto_resubscribe', True))}")
             yield reply("🔍 调试信息:\n" + "\n".join(debug_info))
             return
 
@@ -658,17 +672,27 @@ class Conversa(Star):
                 return
 
             elif target == "quiet":
-                if not self._is_admin(event):
-                    yield reply("错误：此命令仅限管理员使用。")
-                    return
+                # 用户可以设置自己的免打扰时间，管理员设置全局
                 if re.match(r"^\d{1,2}:\d{2}-\d{1,2}:\d{2}$", value):
-                    settings = self.cfg.get("basic_settings") or {}
-                    settings["quiet_hours"] = value
-                    self.cfg["basic_settings"] = settings
-                    self.cfg.save_config()
-                    yield reply(f"🔕 已设置免打扰：{value}")
+                    umo = event.unified_msg_origin
+                    
+                    # 检查是否是管理员且想设置全局
+                    if self._is_admin(event) and len(args) > 3 and args[3].lower() == "global":
+                        # 管理员设置全局免打扰
+                        settings = self.cfg.get("basic_settings") or {}
+                        settings["quiet_hours"] = value
+                        self.cfg["basic_settings"] = settings
+                        self.cfg.save_config()
+                        yield reply(f"🔕 已设置全局免打扰：{value}")
+                    else:
+                        # 用户设置自己的免打扰时间
+                        if umo not in self._user_profiles:
+                            self._user_profiles[umo] = UserProfile()
+                        self._user_profiles[umo].quiet_hours = value
+                        self._save_user_data()
+                        yield reply(f"🔕 已为您设置专属免打扰：{value}")
                 else:
-                    yield reply("格式错误，请使用 HH:MM-HH:MM 格式。")
+                    yield reply("格式错误，请使用 HH:MM-HH:MM 格式。例如: 23:00-07:00")
                 return
             
             elif target == "history":
@@ -778,10 +802,13 @@ class Conversa(Star):
             "/conversa on/off - (管理员)全局启用或禁用插件\n"
             "/conversa watch/unwatch - 订阅或退订当前会话\n"
             "/conversa set after <小时> - x小时后主动问候（最低0.5）\n"
+            "/conversa set quiet <HH:MM-HH:MM> - 设置您的专属免打扰时间\n"
+            "/conversa set quiet <HH:MM-HH:MM> global - (管理员)设置全局免打扰\n"
             "/conversa remind <add/list/del> [参数...]\n"
-            "  - add <HH:MM> <提醒内容> - 添加一个每日提醒，可以直接使用自然语言，如：提醒我早睡\n"
-            "  - list - 显示当前会话的所有提醒（显示序号）\n"
-            "  - del <序号> - 删除指定序号的提醒（如：del 1）"
+            "  - add <HH:MM> <提醒内容> - 添加每日提醒\n"
+            "  - add <YYYY-MM-DD HH:MM> <提醒内容> - 添加一次性提醒\n"
+            "  - list - 显示当前会话的所有提醒\n"
+            "  - del <序号> - 删除指定序号的提醒"
         )
 
     def _get_user_reminders_sorted(self, umo: str) -> List[Reminder]:
@@ -846,7 +873,9 @@ class Conversa(Star):
                 if not profile.subscribed:
                     continue
                 
-                if _in_quiet(now, quiet):
+                # 优先使用用户专属免打扰时间，否则使用全局设置
+                user_quiet = profile.quiet_hours if profile.quiet_hours else quiet
+                if _in_quiet(now, user_quiet):
                     continue
 
                 st = self._states.get(umo)
