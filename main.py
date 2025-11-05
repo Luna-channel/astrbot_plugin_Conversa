@@ -202,7 +202,7 @@ class Reminder:
         )
 
 # 主插件类
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.3.0", 
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.3.1", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
@@ -383,23 +383,49 @@ class Conversa(Star):
         # 创建新的延迟保存任务
         self._save_session_data_task = asyncio.create_task(delayed_save())
     
-    def _sync_subscribed_users_from_config(self):
-        """从配置文件同步订阅用户列表到内部状态"""
+    def _sync_subscribed_users_from_config(self, silent: bool = False):
+        """
+        从配置文件同步订阅用户列表到内部状态
+        
+        Args:
+            silent: 是否静默模式（不打印日志，仅在状态变化时打印）
+        """
         try:
             config_subscribed_ids = self._get_cfg("basic_settings", "subscribed_users") or []
             if not isinstance(config_subscribed_ids, list):
                 logger.warning(f"[Conversa] subscribed_users 配置格式错误，应为列表")  # noqa: F541
                 return
             
+            # 记录变化
+            changes = {"added": [], "removed": []}
+            
+            # 同步所有用户的订阅状态（包括设置为 True 和 False）
             for user_id, profile in self._user_profiles.items():
                 if user_id in config_subscribed_ids:
-                    profile.subscribed = True
-                    logger.debug(f"[Conversa] 从配置同步订阅状态: {user_id}")
-
-            logger.info(f"[Conversa] 已从配置同步 {len(config_subscribed_ids)} 个订阅用户ID")
+                    if not profile.subscribed:
+                        profile.subscribed = True
+                        changes["added"].append(user_id)
+                        if not silent:
+                            logger.debug(f"[Conversa] 从配置同步订阅状态(启用): {user_id}")
+                else:
+                    # 如果用户不在配置列表中，设置为未订阅
+                    if profile.subscribed:
+                        profile.subscribed = False
+                        changes["removed"].append(user_id)
+                        if not silent:
+                            logger.debug(f"[Conversa] 从配置同步订阅状态(禁用): {user_id}")
             
-            subscribed_sessions = [user_id for user_id, profile in self._user_profiles.items() if profile.subscribed]
-            logger.info(f"[Conversa] 当前已订阅的会话数: {len(subscribed_sessions)}")
+            # 只在有变化或非静默模式时打印信息
+            if not silent or changes["added"] or changes["removed"]:
+                if changes["added"]:
+                    logger.info(f"[Conversa] 配置热重载：新增订阅 {changes['added']}")
+                if changes["removed"]:
+                    logger.info(f"[Conversa] 配置热重载：取消订阅 {changes['removed']}")
+                
+                if not silent and not changes["added"] and not changes["removed"]:
+                    logger.info(f"[Conversa] 已从配置同步 {len(config_subscribed_ids)} 个订阅用户ID")
+                    subscribed_sessions = [user_id for user_id, profile in self._user_profiles.items() if profile.subscribed]
+                    logger.info(f"[Conversa] 当前已订阅的会话数: {len(subscribed_sessions)}")
             
         except Exception as e:
             logger.error(f"[Conversa] 同步订阅用户配置失败: {e}")
@@ -451,24 +477,32 @@ class Conversa(Star):
         st = self._states[umo]
         profile = self._user_profiles[umo]
 
+        # 保存旧的 last_user_reply_ts 用于判断是否是老用户
+        old_last_user_reply_ts = st.last_user_reply_ts
+
         # 更新时间戳
         now_ts = _now_tz(self._get_cfg("basic_settings", "timezone") or None).timestamp()
         st.last_ts = now_ts
         st.last_user_reply_ts = now_ts
         st.consecutive_no_reply_count = 0
 
-        # 自动订阅模式
+        # 自动订阅模式：仅在首次创建用户时自动订阅
         if (self._get_cfg("basic_settings", "subscribe_mode") or "manual") == "auto":
-            profile.subscribed = True
+            # 只在用户第一次发消息时（old_last_user_reply_ts == 0）自动订阅
+            if old_last_user_reply_ts == 0:
+                profile.subscribed = True
+                logger.info(f"[Conversa] 自动订阅模式：新用户 {umo} 已自动订阅")
+                self._sync_subscribed_users_to_config()  # 同步到配置文件
         
         # 自动重新激活：如果用户主动聊天，且曾经订阅过（被自动退订），则重新激活
-        if not profile.subscribed and st.last_user_reply_ts > 0:
+        if not profile.subscribed and old_last_user_reply_ts > 0:
             # 检查是否是因为超时被自动退订的（有历史活跃记录）
             auto_resubscribe = bool(self._get_cfg("basic_settings", "auto_resubscribe", True))
             if auto_resubscribe:
                 # 用户主动发消息，重新激活订阅
                 profile.subscribed = True
                 logger.info(f"[Conversa] 自动重新激活订阅: {umo} (用户主动聊天)")
+                self._sync_subscribed_users_to_config()  # 同步到配置文件
 
 
         # 计算下一次延时问候触发时间
@@ -850,13 +884,17 @@ class Conversa(Star):
         
         检查逻辑：
         1. 如果插件被停用，直接返回
-        2. 遍历所有已订阅的会话，检查是否需要主动回复
-        3. 检查是否在免打扰时间段内
-        4. 检查是否需要自动退订
-        5. 检查并触发提醒事项
+        2. 从配置同步订阅状态（实现配置热重载）
+        3. 遍历所有已订阅的会话，检查是否需要主动回复
+        4. 检查是否在免打扰时间段内
+        5. 检查是否需要自动退订
+        6. 检查并触发提醒事项
         """
         if not self.cfg.get("enable", True):
             return
+        
+        # 从配置同步订阅状态（实现配置热重载，静默模式，只在有变化时打印日志）
+        self._sync_subscribed_users_from_config(silent=True)
 
         tz = self._get_cfg("basic_settings", "timezone") or None
         now = _now_tz(tz)
@@ -1027,6 +1065,7 @@ class Conversa(Star):
                 profile.subscribed = False
                 logger.info(f"[Conversa] 自动退订 {umo}：用户{days_since_reply}天未回复")
                 self._save_user_data()
+                self._sync_subscribed_users_to_config()  # 同步到配置文件
                 return True
 
         return False
