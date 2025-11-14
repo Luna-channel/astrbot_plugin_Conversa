@@ -21,6 +21,17 @@ try:
 except ImportError:
     HAS_STARTOOLS = False
 
+# 尝试导入新的Message模型（新版本astrbot）
+try:
+    from astrbot.core.agent.message import (
+        AssistantMessageSegment,
+        UserMessageSegment,
+        TextPart,
+    )
+    HAS_NEW_MESSAGE_API = True
+except ImportError:
+    HAS_NEW_MESSAGE_API = False
+
 # 工具函数
 def _ensure_dir(p: str) -> str:
     """确保目录存在，不存在则创建"""
@@ -89,6 +100,8 @@ class UserProfile:
     daily_reminders_enabled: bool = True
     daily_reminder_count: int = 3
     quiet_hours: str | None = None  # 用户专属免打扰时间 "HH:MM-HH:MM"
+    manual_unsubscribe: bool = False  # 标记是否是手动退订（强开关）
+    auto_unsubscribed: bool = False  # 标记是否是自动退订（用于自动重新激活判断）
 
     def to_dict(self):
         return {
@@ -96,7 +109,9 @@ class UserProfile:
             "idle_after_minutes": self.idle_after_minutes,
             "daily_reminders_enabled": self.daily_reminders_enabled,
             "daily_reminder_count": self.daily_reminder_count,
-            "quiet_hours": self.quiet_hours
+            "quiet_hours": self.quiet_hours,
+            "manual_unsubscribe": self.manual_unsubscribe,
+            "auto_unsubscribed": self.auto_unsubscribed
         }
 
     @classmethod
@@ -106,7 +121,9 @@ class UserProfile:
             idle_after_minutes=data.get("idle_after_minutes"),
             daily_reminders_enabled=data.get("daily_reminders_enabled", True),
             daily_reminder_count=data.get("daily_reminder_count", 3),
-            quiet_hours=data.get("quiet_hours")
+            quiet_hours=data.get("quiet_hours"),
+            manual_unsubscribe=data.get("manual_unsubscribe", False),
+            auto_unsubscribed=data.get("auto_unsubscribed", False)
         )
 
 @dataclass
@@ -202,7 +219,7 @@ class Reminder:
         )
 
 # 主插件类
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.3.1", 
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.4", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
@@ -404,13 +421,17 @@ class Conversa(Star):
                 if user_id in config_subscribed_ids:
                     if not profile.subscribed:
                         profile.subscribed = True
+                        profile.manual_unsubscribe = False  # 清除手动退订标记
+                        profile.auto_unsubscribed = False  # 清除自动退订标记
                         changes["added"].append(user_id)
                         if not silent:
                             logger.debug(f"[Conversa] 从配置同步订阅状态(启用): {user_id}")
                 else:
-                    # 如果用户不在配置列表中，设置为未订阅
+                    # 如果用户不在配置列表中，设置为未订阅（来自 WebUI 的手动退订）
                     if profile.subscribed:
                         profile.subscribed = False
+                        profile.manual_unsubscribe = True  # 标记为手动退订（WebUI操作视为手动）
+                        profile.auto_unsubscribed = False  # 清除自动退订标记
                         changes["removed"].append(user_id)
                         if not silent:
                             logger.debug(f"[Conversa] 从配置同步订阅状态(禁用): {user_id}")
@@ -489,19 +510,20 @@ class Conversa(Star):
         # 自动订阅模式：仅在首次创建用户时自动订阅
         if (self._get_cfg("basic_settings", "subscribe_mode") or "manual") == "auto":
             # 只在用户第一次发消息时（old_last_user_reply_ts == 0）自动订阅
-            if old_last_user_reply_ts == 0:
+            if old_last_user_reply_ts == 0 and not profile.manual_unsubscribe:
                 profile.subscribed = True
+                profile.auto_unsubscribed = False  # 清除自动退订标记
                 logger.info(f"[Conversa] 自动订阅模式：新用户 {umo} 已自动订阅")
                 self._sync_subscribed_users_to_config()  # 同步到配置文件
         
-        # 自动重新激活：如果用户主动聊天，且曾经订阅过（被自动退订），则重新激活
-        if not profile.subscribed and old_last_user_reply_ts > 0:
-            # 检查是否是因为超时被自动退订的（有历史活跃记录）
+        # 自动重新激活：仅对"被自动退订"的用户生效，手动退订的用户不会被自动重新激活
+        if not profile.subscribed and profile.auto_unsubscribed and not profile.manual_unsubscribe:
             auto_resubscribe = bool(self._get_cfg("basic_settings", "auto_resubscribe", True))
             if auto_resubscribe:
                 # 用户主动发消息，重新激活订阅
                 profile.subscribed = True
-                logger.info(f"[Conversa] 自动重新激活订阅: {umo} (用户主动聊天)")
+                profile.auto_unsubscribed = False  # 清除自动退订标记
+                logger.info(f"[Conversa] 自动重新激活订阅: {umo} (用户在自动退订后主动聊天)")
                 self._sync_subscribed_users_to_config()  # 同步到配置文件
 
 
@@ -587,6 +609,16 @@ class Conversa(Star):
                 self._states[umo] = SessionState()
             profile = self._user_profiles.get(umo)
             debug_info.append(f"用户订阅状态: {profile.subscribed if profile else False}")
+            
+            # 显示订阅/退订状态标记
+            if profile:
+                if profile.manual_unsubscribe:
+                    debug_info.append("退订类型: 手动退订（强制，不会自动重新激活）")
+                elif profile.auto_unsubscribed:
+                    debug_info.append("退订类型: 自动退订（可自动重新激活）")
+                elif profile.subscribed:
+                    debug_info.append("订阅类型: 正常订阅")
+            
             debug_info.append(f"用户专属免打扰: {profile.quiet_hours if profile and profile.quiet_hours else '未设置(使用全局)'}")
             debug_info.append(f"全局免打扰时间: {self._get_cfg('basic_settings', 'quiet_hours', '未设置')}")
             debug_info.append(f"延时基准: {self._get_cfg('idle_greetings', 'idle_after_minutes', 0)}分钟")
@@ -623,7 +655,10 @@ class Conversa(Star):
             umo = event.unified_msg_origin
             if umo not in self._user_profiles:
                 self._user_profiles[umo] = UserProfile()
-            self._user_profiles[umo].subscribed = True
+            profile = self._user_profiles[umo]
+            profile.subscribed = True
+            profile.manual_unsubscribe = False  # 清除手动退订标记
+            profile.auto_unsubscribed = False  # 清除自动退订标记
             logger.info(f"[Conversa] 用户执行 watch 命令: {umo}")
             self._save_user_data()
             self._sync_subscribed_users_to_config()
@@ -634,7 +669,11 @@ class Conversa(Star):
             umo = event.unified_msg_origin
             if umo not in self._user_profiles:
                 self._user_profiles[umo] = UserProfile()
-            self._user_profiles[umo].subscribed = False
+            profile = self._user_profiles[umo]
+            profile.subscribed = False
+            profile.manual_unsubscribe = True  # 设置手动退订标记（强开关）
+            profile.auto_unsubscribed = False  # 清除自动退订标记
+            logger.info(f"[Conversa] 用户执行 unwatch 命令（手动退订）: {umo}")
             self._save_user_data()
             self._sync_subscribed_users_to_config()
             yield reply("📭 已退订当前会话")
@@ -1053,6 +1092,10 @@ class Conversa(Star):
 
     async def _should_auto_unsubscribe(self, umo: str, profile: UserProfile, st: SessionState, now: datetime) -> bool:
         """检查是否需要自动退订（根据用户无回复天数）"""
+        # 手动退订的用户不会被自动退订逻辑处理
+        if profile.manual_unsubscribe:
+            return False
+        
         max_days = int(self._get_cfg("basic_settings", "max_no_reply_days") or 0)
         if max_days <= 0:
             return False
@@ -1063,7 +1106,9 @@ class Conversa(Star):
 
             if days_since_reply >= max_days:
                 profile.subscribed = False
-                logger.info(f"[Conversa] 自动退订 {umo}：用户{days_since_reply}天未回复")
+                profile.auto_unsubscribed = True  # 标记为自动退订
+                profile.manual_unsubscribe = False  # 确保不是手动退订状态
+                logger.info(f"[Conversa] 自动退订 {umo}：用户{days_since_reply}天未回复（可自动重新激活）")
                 self._save_user_data()
                 self._sync_subscribed_users_to_config()  # 同步到配置文件
                 return True
@@ -1308,11 +1353,13 @@ class Conversa(Star):
 
     async def _add_message_pair_to_history(self, umo: str, conversation_id: str, conversation, user_prompt: str, assistant_response: str):
         """
-        手动将模拟的用户 prompt 和 AI 回复添加到对话历史
+        将模拟的用户 prompt 和 AI 回复添加到对话历史
         
-        根据 GitHub issue #3216 的解决方案：
-        - 需要同时将"模拟的用户 Prompt"和"AI的回复"作为一个完整的 user -> assistant 对
-        - 一起追加到 history 列表的末尾，然后再调用 update_conversation
+        优先使用新版本的 add_message_pair API（如果可用），否则回退到旧的手动操作方式。
+        新API的优势：
+        1. 使用框架标准API，更规范
+        2. 框架内部可能优化，减少不必要的事件触发
+        3. 代码更简洁，维护性更好
         """
         try:
             # 检查 conversation_id 是否有效
@@ -1320,8 +1367,33 @@ class Conversa(Star):
                 logger.warning("[Conversa] conversation_id 为空，无法更新历史")
                 return
             
-            # 重新获取 conversation 以确保获取最新状态
             conv_mgr = self.context.conversation_manager
+            
+            # 优先使用新版本的 add_message_pair API
+            if HAS_NEW_MESSAGE_API:
+                try:
+                    # 使用新的Message模型
+                    user_msg = UserMessageSegment(content=[TextPart(text=user_prompt)])
+                    assistant_msg = AssistantMessageSegment(
+                        content=[TextPart(text=assistant_response)]
+                    )
+                    
+                    await conv_mgr.add_message_pair(
+                        cid=conversation_id,
+                        user_message=user_msg,
+                        assistant_message=assistant_msg,
+                    )
+                    
+                    logger.info(f"[Conversa] ✅ 已使用新API添加消息对到历史：user({len(user_prompt)}字符) + assistant({len(assistant_response)}字符)")
+                    return
+                    
+                except AttributeError:
+                    # add_message_pair 方法不存在，回退到旧方法
+                    logger.debug("[Conversa] add_message_pair 方法不可用，回退到旧方法")
+                except Exception as e:
+                    logger.warning(f"[Conversa] 使用新API失败，回退到旧方法: {e}")
+            
+            # 回退方案：使用旧的手动操作方式（兼容旧版本astrbot）
             conversation = await conv_mgr.get_conversation(umo, conversation_id)
             if not conversation:
                 logger.warning("[Conversa] 无法获取 conversation 对象")
@@ -1362,7 +1434,7 @@ class Conversa(Star):
                 history=current_history
             )
             
-            logger.info(f"[Conversa] ✅ 已将主动回复添加到历史：user({len(user_prompt)}字符) + assistant({len(assistant_response)}字符)，总记录数: {len(current_history)}")
+            logger.info(f"[Conversa] ✅ 已使用旧方法添加消息对到历史：user({len(user_prompt)}字符) + assistant({len(assistant_response)}字符)，总记录数: {len(current_history)}")
             
         except Exception as e:
             logger.error(f"[Conversa] ❌ 添加消息对到历史失败: {e}", exc_info=True)
