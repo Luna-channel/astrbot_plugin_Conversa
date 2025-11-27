@@ -1589,6 +1589,24 @@ class Conversa(Star):
     async def _send_text(self, umo: str, text: str):
         """发送主动回复消息到指定会话"""
         try:
+            # 检查 umo 是否缺少 session_id（例如：platform:MessageType:None）
+            # 如果是，尝试从 conversation_manager 获取完整的 umo
+            if umo.endswith(":None") or ":None" in umo:
+                try:
+                    conv_mgr = self.context.conversation_manager
+                    # 尝试获取当前会话ID
+                    curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+                    if curr_cid:
+                        # 重新构造完整的 umo
+                        # umo 格式通常是 platform:MessageType:session_id
+                        parts = umo.split(":")
+                        if len(parts) >= 2:
+                            # 使用获取到的 conversation_id 替换 None
+                            umo = f"{parts[0]}:{parts[1]}:{curr_cid}"
+                            logger.debug(f"[Conversa] 修复 umo: {umo}")
+                except Exception as e:
+                    logger.warning(f"[Conversa] 尝试修复 umo 失败: {e}")
+            
             # 使用文档推荐的方式构造消息链
             message_chain = MessageChain().message(text)
             await self.context.send_message(umo, message_chain)
