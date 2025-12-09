@@ -91,6 +91,37 @@ def _fmt_now(fmt: str, tz: str | None) -> str:
     """格式化当前时间为指定格式"""
     return _now_tz(tz).strftime(fmt)
 
+
+def _format_time_delta(seconds: float) -> str:
+    """将时间差（秒）格式化为友好的文本
+    
+    示例：
+    - 180秒 -> "3分钟"
+    - 3600秒 -> "1小时"
+    - 7200秒 -> "2小时"
+    - 86400秒 -> "1天"
+    - 90000秒 -> "1天1小时"
+    """
+    if seconds < 60:
+        return "不到1分钟"
+    
+    minutes = int(seconds / 60)
+    hours = int(minutes / 60)
+    days = int(hours / 24)
+    
+    if days > 0:
+        remaining_hours = hours % 24
+        if remaining_hours > 0:
+            return f"{days}天{remaining_hours}小时"
+        return f"{days}天"
+    elif hours > 0:
+        remaining_minutes = minutes % 60
+        if remaining_minutes > 0:
+            return f"{hours}小时{remaining_minutes}分钟"
+        return f"{hours}小时"
+    else:
+        return f"{minutes}分钟"
+
 # 数据类定义
 @dataclass
 class UserProfile:
@@ -219,7 +250,7 @@ class Reminder:
         )
 
 # 主插件类
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.4", 
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.4.1", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
@@ -1241,11 +1272,21 @@ class Conversa(Star):
                         last_ai = m.get("content", "")
                     if last_user and last_ai:
                         break
+                
+                # 计算距离上次聊天的时间
+                st = self._states.get(umo)
+                time_since_last_chat = "未知"
+                if st and st.last_user_reply_ts > 0:
+                    now_ts = _now_tz(tz).timestamp()
+                    time_delta = now_ts - st.last_user_reply_ts
+                    time_since_last_chat = _format_time_delta(time_delta)
+                
                 prompt = prompt_template.format(
                     now=_fmt_now(self._get_cfg("basic_settings", "time_format") or "%Y-%m-%d %H:%M", tz),
                     last_user=last_user,
                     last_ai=last_ai,
-                    umo=umo
+                    umo=umo,
+                    time_since_last_chat=time_since_last_chat
                 )
             else:
                 prompt = "请自然地延续对话，与用户继续交流。"
@@ -1586,6 +1627,49 @@ class Conversa(Star):
         
         return normalized
     
+    def _apply_segmentation(self, text: str) -> list[str]:
+        """应用分段回复逻辑（模拟 AstrBot 的分段正则处理）
+        
+        Returns:
+            分段后的文本列表
+        """
+        try:
+            # 获取分段配置
+            seg_config = self.context.astrbot_config.get("platform_settings", {}).get("segmented_reply", {})
+            
+            # 检查是否启用分段
+            if not seg_config.get("enable", False):
+                return [text]
+            
+            # 获取配置参数
+            words_threshold = int(seg_config.get("words_count_threshold", 1000))
+            regex_pattern = seg_config.get("regex", r"[^。！？\n]+[。！？\n]?")
+            cleanup_rule = seg_config.get("content_cleanup_rule", "")
+            
+            # 如果文本过长，不分段（与 AstrBot 逻辑一致）
+            if len(text) > words_threshold:
+                return [text]
+            
+            # 应用分段正则
+            segments = re.findall(regex_pattern, text, re.DOTALL | re.MULTILINE)
+            
+            if not segments:
+                return [text]
+            
+            # 清理并过滤空段落
+            result = []
+            for seg in segments:
+                if cleanup_rule:
+                    seg = re.sub(cleanup_rule, "", seg)
+                if seg.strip():
+                    result.append(seg)
+            
+            return result if result else [text]
+            
+        except Exception as e:
+            logger.warning(f"[Conversa] 分段处理失败，使用原始文本: {e}")
+            return [text]
+    
     async def _send_text(self, umo: str, text: str):
         """发送主动回复消息到指定会话"""
         try:
@@ -1607,10 +1691,18 @@ class Conversa(Star):
                 except Exception as e:
                     logger.warning(f"[Conversa] 尝试修复 umo 失败: {e}")
             
-            # 使用文档推荐的方式构造消息链
-            message_chain = MessageChain().message(text)
-            await self.context.send_message(umo, message_chain)
-            logger.info(f"[Conversa] ✅ 消息已发送: {text[:50]}...")
+            # 应用分段逻辑
+            segments = self._apply_segmentation(text)
+            
+            # 发送每个分段
+            for segment in segments:
+                message_chain = MessageChain().message(segment)
+                await self.context.send_message(umo, message_chain)
+                logger.info(f"[Conversa] ✅ 消息片段已发送: {segment[:50]}...")
+                
+                # 如果有多个分段，添加短暂延迟（模拟分段回复的间隔）
+                if len(segments) > 1:
+                    await asyncio.sleep(1.5)
             
         except Exception as e:
             logger.error(f"[Conversa] ❌ 发送消息失败({umo}): {e}")
