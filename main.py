@@ -1635,7 +1635,7 @@ class Conversa(Star):
         """
         try:
             # 获取分段配置
-            seg_config = self.context.astrbot_config.get("platform_settings", {}).get("segmented_reply", {})
+            seg_config = self.context.get_config().get("platform_settings", {}).get("segmented_reply", {})
             
             # 检查是否启用分段
             if not seg_config.get("enable", False):
