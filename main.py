@@ -32,10 +32,6 @@ try:
 except ImportError:
     HAS_NEW_MESSAGE_API = False
 
-# 插件注册
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.4.2", 
-          "https://github.com/Luna-channel/astrbot_plugin_Conversa")
-
 # 工具函数
 def _ensure_dir(p: str) -> str:
     """确保目录存在，不存在则创建"""
@@ -253,6 +249,9 @@ class Reminder:
             created_at=data.get("created_at")
         )
 
+# 主插件类
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.4.2", 
+          "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
     # 初始化
