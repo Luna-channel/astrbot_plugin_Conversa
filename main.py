@@ -32,6 +32,10 @@ try:
 except ImportError:
     HAS_NEW_MESSAGE_API = False
 
+# 插件注册
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.4.2", 
+          "https://github.com/Luna-channel/astrbot_plugin_Conversa")
+
 # 工具函数
 def _ensure_dir(p: str) -> str:
     """确保目录存在，不存在则创建"""
@@ -249,9 +253,6 @@ class Reminder:
             created_at=data.get("created_at")
         )
 
-# 主插件类
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.4.1", 
-          "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
     # 初始化
@@ -331,12 +332,12 @@ class Conversa(Star):
                 profiles_data = data.get("profiles", {})
                 for user_id, profile_dict in profiles_data.items():
                     self._user_profiles[user_id] = UserProfile.from_dict(profile_dict)
-                logger.info(f"[Conversa] Loaded {len(self._user_profiles)} user profiles.")
+                logger.debug(f"[Conversa] Loaded {len(self._user_profiles)} user profiles.")
                 
                 reminders_data = data.get("reminders", {})
                 for reminder_id, reminder_dict in reminders_data.items():
                     self._reminders[reminder_id] = Reminder.from_dict(reminder_dict)
-                logger.info(f"[Conversa] Loaded {len(self._reminders)} reminders.")
+                logger.debug(f"[Conversa] Loaded {len(self._reminders)} reminders.")
         
         except (json.JSONDecodeError, TypeError) as e:
             logger.error(f"[Conversa] Failed to load user data: {e}")
@@ -370,7 +371,7 @@ class Conversa(Star):
                 states_data = data.get("states", {})
                 for conv_id, state_dict in states_data.items():
                     self._states[conv_id] = SessionState.from_dict(state_dict)
-                logger.info(f"[Conversa] Loaded {len(self._states)} session states.")
+                logger.debug(f"[Conversa] Loaded {len(self._states)} session states.")
         
         except (json.JSONDecodeError, TypeError) as e:
             logger.error(f"[Conversa] Failed to load session data: {e}")
@@ -475,9 +476,9 @@ class Conversa(Star):
                     logger.info(f"[Conversa] 配置热重载：取消订阅 {changes['removed']}")
                 
                 if not silent and not changes["added"] and not changes["removed"]:
-                    logger.info(f"[Conversa] 已从配置同步 {len(config_subscribed_ids)} 个订阅用户ID")
+                    logger.debug(f"[Conversa] 已从配置同步 {len(config_subscribed_ids)} 个订阅用户ID")
                     subscribed_sessions = [user_id for user_id, profile in self._user_profiles.items() if profile.subscribed]
-                    logger.info(f"[Conversa] 当前已订阅的会话数: {len(subscribed_sessions)}")
+                    logger.debug(f"[Conversa] 当前已订阅的会话数: {len(subscribed_sessions)}")
             
         except Exception as e:
             logger.error(f"[Conversa] 同步订阅用户配置失败: {e}")
@@ -495,7 +496,7 @@ class Conversa(Star):
                 self.cfg["basic_settings"] = {}
             self.cfg["basic_settings"]["subscribed_users"] = subscribed_users
             self.cfg.save_config()
-            logger.info(f"[Conversa] 已同步 {len(subscribed_users)} 个订阅用户到配置文件")
+            logger.debug(f"[Conversa] 已同步 {len(subscribed_users)} 个订阅用户到配置文件")
         except Exception as e:
             logger.error(f"[Conversa] 同步订阅用户到配置失败: {e}")
     
@@ -1068,7 +1069,7 @@ class Conversa(Star):
                 # 基于最后活跃时间计算
                 base_ts = st.last_ts if st.last_ts > 0 else now.timestamp()
                 st.next_idle_ts = base_ts + delay_m * 60
-                logger.info(f"[Conversa] 向后兼容：为 {umo} 初始化 next_idle_ts = {st.next_idle_ts}")
+                logger.debug(f"[Conversa] 向后兼容：为 {umo} 初始化 next_idle_ts = {st.next_idle_ts}")
                 await self._debounced_save_session_data()
                 return  # 本次不触发，等下次检查
         
@@ -1498,13 +1499,13 @@ class Conversa(Star):
             if conversation and getattr(conversation, "persona_id", None):
                 persona = await persona_mgr.get_persona(conversation.persona_id)
                 if persona and getattr(persona, "system_prompt", None):
-                    logger.info(f"[Conversa] 使用会话人格: {conversation.persona_id}")
+                    logger.debug(f"[Conversa] 使用会话人格: {conversation.persona_id}")
                     return persona.system_prompt
             
             # 2. 使用默认人格
             default_persona = await persona_mgr.get_default_persona_v3(umo=umo)
             if default_persona and default_persona.get("prompt"):
-                logger.info(f"[Conversa] 使用默认人格: {default_persona.get('name', 'Unknown')}")
+                logger.debug(f"[Conversa] 使用默认人格: {default_persona.get('name', 'Unknown')}")
                 return default_persona["prompt"]
                 
         except Exception as e:
@@ -1519,13 +1520,13 @@ class Conversa(Star):
         # 策略1：从传入的conversation对象获取
         contexts = await self._try_get_from_conversation(conversation)
         if contexts:
-            logger.info(f"[Conversa] ✅ 策略1成功: 获取{len(contexts)}条历史")
+            logger.debug(f"[Conversa] ✅ 策略1成功: 获取{len(contexts)}条历史")
             return contexts
         
         # 策略2：通过conversation_manager重新获取
         contexts = await self._try_get_from_manager(umo)
         if contexts:
-            logger.info(f"[Conversa] ✅ 策略2成功: 获取{len(contexts)}条历史")
+            logger.debug(f"[Conversa] ✅ 策略2成功: 获取{len(contexts)}条历史")
             return contexts
         
         logger.warning(f"[Conversa] ⚠️ 无法获取 {umo} 的对话历史，将使用空上下文")
@@ -1698,7 +1699,7 @@ class Conversa(Star):
             for segment in segments:
                 message_chain = MessageChain().message(segment)
                 await self.context.send_message(umo, message_chain)
-                logger.info(f"[Conversa] ✅ 消息片段已发送: {segment[:50]}...")
+                logger.debug(f"[Conversa] ✅ 消息片段已发送: {segment[:50]}...")
                 
                 # 如果有多个分段，添加短暂延迟（模拟分段回复的间隔）
                 if len(segments) > 1:
