@@ -250,7 +250,7 @@ class Reminder:
         )
 
 # 主插件类
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.4.2", 
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.4.3", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
@@ -1457,12 +1457,12 @@ class Conversa(Star):
                 logger.info("[Conversa] conversation.history 为空，将创建新历史")
                 current_history = []
             
-            # 1. 存档我们模拟的 "user" 消息
-            user_record = {"role": "user", "content": user_prompt}
+            # 1. 存档我们模拟的 "user" 消息（使用新格式 ContentPart 列表）
+            user_record = {"role": "user", "content": [{"type": "text", "text": user_prompt}]}
             current_history.append(user_record)
             
-            # 2. 存档 AI 生成的 "assistant" 消息
-            assistant_record = {"role": "assistant", "content": assistant_response}
+            # 2. 存档 AI 生成的 "assistant" 消息（使用新格式 ContentPart 列表）
+            assistant_record = {"role": "assistant", "content": [{"type": "text", "text": assistant_response}]}
             current_history.append(assistant_record)
             
             logger.info(f"[Conversa] 准备更新历史，当前历史记录数: {len(current_history)}")
@@ -1601,7 +1601,13 @@ class Conversa(Star):
             return None
     
     def _normalize_messages(self, msgs) -> List[Dict]:
-        """标准化消息格式，兼容多种数据源"""
+        """标准化消息格式，兼容多种数据源
+        
+        支持的消息格式：
+        1. 旧格式：{"role": "user", "content": "Hello"}
+        2. 新格式（ContentPart列表）：{"role": "user", "content": [{"type": "text", "text": "Hello"}]}
+        3. 嵌套结构：{"messages": [...]}
+        """
         if not msgs:
             return []
         
@@ -1617,15 +1623,57 @@ class Conversa(Star):
             if not isinstance(msg, dict):
                 continue
             
-            # 提取角色和内容
+            # 提取角色
             role = msg.get("role") or msg.get("speaker") or msg.get("from")
-            content = msg.get("content") or msg.get("text") or msg.get("message") or ""
+            if role not in ("user", "assistant", "system"):
+                continue
+            
+            # 提取内容（兼容新旧格式）
+            content = self._extract_content_text(msg)
             
             # 验证并添加
-            if role in ("user", "assistant", "system") and content and isinstance(content, str):
+            if content:
                 normalized.append({"role": role, "content": content.strip()})
         
         return normalized
+    
+    def _extract_content_text(self, msg: dict) -> str:
+        """从消息中提取文本内容，兼容新旧格式
+        
+        新版 AstrBot 的 content 可能是：
+        1. str: 直接的文本内容（旧格式）
+        2. list[ContentPart]: [{"type": "text", "text": "..."}, {"type": "think", "think": "..."}]
+        3. None: 空内容（如纯工具调用消息）
+        """
+        raw_content = msg.get("content")
+        
+        # 情况1：字符串格式（旧格式，直接返回）
+        if isinstance(raw_content, str):
+            return raw_content
+        
+        # 情况2：列表格式（新格式 ContentPart 列表）
+        if isinstance(raw_content, list):
+            text_parts = []
+            for part in raw_content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type", "")
+                # 提取 TextPart 的文本
+                if part_type == "text" and part.get("text"):
+                    text_parts.append(str(part["text"]))
+                # 也可以选择性提取 ThinkPart（思考内容），但通常不包含在对话历史中
+                # elif part_type == "think" and part.get("think"):
+                #     text_parts.append(f"[思考: {part['think']}]")
+            
+            if text_parts:
+                return " ".join(text_parts)
+        
+        # 情况3：尝试其他备选字段（向后兼容）
+        fallback = msg.get("text") or msg.get("message") or ""
+        if isinstance(fallback, str):
+            return fallback
+        
+        return ""
     
     def _apply_segmentation(self, text: str) -> list[str]:
         """应用分段回复逻辑（模拟 AstrBot 的分段正则处理）
