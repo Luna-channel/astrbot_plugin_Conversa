@@ -250,7 +250,7 @@ class Reminder:
         )
 
 # 主插件类
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.4.3", 
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.4.4", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
@@ -1266,10 +1266,16 @@ class Conversa(Star):
                 last_user = ""
                 last_ai = ""
                 for m in reversed(contexts):
-                    if not last_user and m.get("role") == "user":
-                        last_user = m.get("content", "")
-                    if not last_ai and m.get("role") == "assistant":
-                        last_ai = m.get("content", "")
+                    role = m.get("role", "")
+                    content = m.get("content", "")
+                    # 处理 content 可能是列表格式的情况（新版 AstrBot）
+                    if isinstance(content, list):
+                        content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+                    content = str(content)[:100]  # 限制长度
+                    if not last_user and role == "user":
+                        last_user = content
+                    if not last_ai and role == "assistant":
+                        last_ai = content
                     if last_user and last_ai:
                         break
                 
@@ -1359,13 +1365,49 @@ class Conversa(Star):
 
             # 构造提醒专用的 Prompt
             prompt_template = self._get_cfg("reminders_settings", "reminder_prompt_template") or "用户提醒：{reminder_content}"
-            prompt = prompt_template.format(
-                reminder_content=reminder_content,
-                now=_fmt_now(
-                    self._get_cfg("basic_settings", "time_format") or "%Y-%m-%d %H:%M",
-                    self._get_cfg("basic_settings", "timezone")
+            
+            # 计算距离上次聊天的时间（供模板使用）
+            tz = self._get_cfg("basic_settings", "timezone")
+            st = self._states.get(umo)
+            time_since_last_chat = "未知"
+            if st and st.last_user_reply_ts > 0:
+                now_ts = _now_tz(tz).timestamp()
+                time_delta = now_ts - st.last_user_reply_ts
+                time_since_last_chat = _format_time_delta(time_delta)
+            
+            # 获取最近的对话内容（供模板使用）
+            last_user = ""
+            last_ai = ""
+            if contexts:
+                for ctx in reversed(contexts):
+                    role = ctx.get("role", "")
+                    content = ctx.get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+                    if role == "user" and not last_user:
+                        last_user = str(content)[:100]
+                    elif role == "assistant" and not last_ai:
+                        last_ai = str(content)[:100]
+                    if last_user and last_ai:
+                        break
+            
+            # 使用安全的format方式，提供所有可能用到的变量
+            try:
+                prompt = prompt_template.format(
+                    reminder_content=reminder_content,
+                    now=_fmt_now(
+                        self._get_cfg("basic_settings", "time_format") or "%Y-%m-%d %H:%M",
+                        tz
+                    ),
+                    umo=umo,
+                    time_since_last_chat=time_since_last_chat,
+                    last_user=last_user,
+                    last_ai=last_ai
                 )
-            )
+            except KeyError as e:
+                # 如果模板中有未知的占位符，使用默认模板
+                logger.warning(f"[Conversa] 提醒模板格式化失败，未知占位符: {e}，使用默认模板")
+                prompt = f"用户提醒：{reminder_content}"
 
             logger.info(f"[Conversa] 触发 AI 提醒 for {umo}: {reminder_content}")
 

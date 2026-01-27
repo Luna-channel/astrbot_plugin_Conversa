@@ -1,12 +1,27 @@
 # Conversa · AI 主动续聊插件 for AstrBot
 
 > **作者**：柯尔 (Luna-channel)  
-> **版本**：v1.4.3  
+> **版本**：v1.4.4  
 > **仓库**：<https://github.com/Luna-channel/astrbot_plugin_Conversa>  
 
 Conversa 是一款为 AstrBot 设计的 **AI 定时主动续聊插件**，它能够在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。
 
 ---
+
+## 🎉 v1.4.4 更新日志
+
+1. **🔧 修复提醒模板变量缺失问题**
+   - 修复 `reminder_prompt_template` 中 `{umo}`、`{time_since_last_chat}`、`{last_user}`、`{last_ai}` 变量不生效的问题
+   - 现在提醒模板与主动回复模板支持完全相同的变量集
+
+2. **📝 优化消息内容提取**
+   - 修复 `{last_user}` 和 `{last_ai}` 变量在新版 AstrBot 中可能显示为列表格式的问题
+   - 正确处理 `ContentPart` 列表格式，提取纯文本内容
+   - 添加内容长度限制（100字符），避免提示词过长
+
+3. **🛡️ 增强模板容错**
+   - 为提醒模板添加 `KeyError` 异常保护
+   - 当模板包含未知占位符时，自动降级使用默认模板并记录警告日志
 
 ## 🎉 v1.4.3 更新日志
 
