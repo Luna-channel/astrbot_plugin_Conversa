@@ -259,6 +259,7 @@ class Conversa(Star):
         super().__init__(context)
         self.cfg: AstrBotConfig = config
         self._loop_task: Optional[asyncio.Task] = None
+        self._stopped: bool = False  # 插件停止标志
         
         # 运行时数据
         self._states: Dict[str, SessionState] = {}
@@ -940,13 +941,17 @@ class Conversa(Star):
     async def _scheduler_loop(self):
         """后台调度循环任务，每30秒检查一次是否需要触发主动回复"""
         try:
-            while True:
+            while not self._stopped:
                 await asyncio.sleep(30)
+                if self._stopped:
+                    break
                 await self._tick()
         except asyncio.CancelledError:
-            logger.info("[Conversa] Scheduler stopped.")
+            pass  # 正常取消，不需要日志
         except Exception as e:
             logger.error(f"[Conversa] Scheduler error: {e}")
+        finally:
+            logger.info("[Conversa] Scheduler stopped.")
 
     async def _tick(self):
         """
@@ -960,6 +965,10 @@ class Conversa(Star):
         5. 检查是否需要自动退订
         6. 检查并触发提醒事项
         """
+        # 检查插件是否已停止（框架禁用插件时会调用terminate设置此标志）
+        if self._stopped:
+            return
+        
         if not self.cfg.get("enable", True):
             return
         
@@ -1804,6 +1813,8 @@ class Conversa(Star):
     # 生命周期管理
     async def terminate(self):
         """插件销毁"""
+        self._stopped = True  # 设置停止标志，让调度器循环退出
+        
         if self._loop_task and not self._loop_task.done():
             self._loop_task.cancel()
             try:
