@@ -305,7 +305,9 @@ class Conversa(Star):
         self._load_user_data()
         self._load_session_data()
         self._sync_subscribed_users_from_config()
-        
+
+    async def initialize(self):
+        """插件激活时的初始化方法（框架生命周期）"""
         # 启动后台调度器
         self._loop_task = asyncio.create_task(self._scheduler_loop())
         logger.info("[Conversa] Scheduler started.")
@@ -575,8 +577,8 @@ class Conversa(Star):
             logger.warning(f"[Conversa] 计算 next_idle_ts 失败: {e}")
 
         # 保存状态（使用去抖机制，减少高频磁盘I/O）
-        self._debounced_save_session_data()
-        self._debounced_save_user_data()
+        await self._debounced_save_session_data()
+        await self._debounced_save_user_data()
 
     @filter.after_message_sent()
     async def _after_message_sent(self, event: AstrMessageEvent):
