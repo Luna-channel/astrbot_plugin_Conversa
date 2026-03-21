@@ -1,47 +1,42 @@
 # Conversa · AI 主动续聊插件 for AstrBot
 
 > **作者**：柯尔 (Luna-channel)  
-> **版本**：v1.4.4  
+> **版本**：v2.0.0  
 > **仓库**：<https://github.com/Luna-channel/astrbot_plugin_Conversa>  
 
 Conversa 是一款为 AstrBot 设计的 **AI 定时主动续聊插件**，它能够在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。
 
 ---
 
-## 🎉 v1.4.4 更新日志
+## 🎉 v2.0.0 更新日志
 
-1. **🔧 修复提醒模板变量缺失问题**
-   - 修复 `reminder_prompt_template` 中 `{umo}`、`{time_since_last_chat}`、`{last_user}`、`{last_ai}` 变量不生效的问题
-   - 现在提醒模板与主动回复模板支持完全相同的变量集
+1. **✨ 对话增强（短期随机追回复）**
+   - AI 正常回复用户后，有可配置概率在延迟一段时间后追加一条主动消息
+   - 支持配置触发概率、最短/最长延迟（上限1800秒）、提示词模板
+   - **指数递减防刷屏**：连续插件主动回复时概率指数级衰减，用户发真实消息后重置
 
-2. **📝 优化消息内容提取**
-   - 修复 `{last_user}` 和 `{last_ai}` 变量在新版 AstrBot 中可能显示为列表格式的问题
-   - 正确处理 `ContentPart` 列表格式，提取纯文本内容
-   - 添加内容长度限制（100字符），避免提示词过长
+2. **🤖 Agent 订阅模式**
+   - 新增 `subscribe_mode: agent` 选项，AI 可通过 Agent 工具调用自动开启/关闭用户订阅
+   - 注册 `conversa_subscribe` LLM Tool，当用户表达“希望你主动找我聊天”时 AI 可自动开启
+   - 与手动 `/conversa watch` 完全兼容
 
-3. **🛡️ 增强模板容错**
-   - 为提醒模板添加 `KeyError` 异常保护
-   - 当模板包含未知占位符时，自动降级使用默认模板并记录警告日志
+3. **� 主动回复历史占位符**
+   - 主动回复写入对话历史时，用简短占位符替代完整提示词，大幅节省 token
+   - 默认占位符：`[Conversa主动发起对话]`，可在配置中自定义
 
-## 🎉 v1.4.3 更新日志
+<details>
+<summary>📁 历史更新日志</summary>
 
-1. **🔧 兼容 AstrBot v4.12+ 新消息格式**
-   - 修复上下文获取问题：适配新版 AstrBot 的 `ContentPart` 列表格式消息
-   - 新增 `_extract_content_text` 方法，支持从 `[{"type": "text", "text": "..."}]` 格式中正确提取文本内容
-   - 同时保持对旧版字符串格式的向后兼容
+## v1.4.4
+- 修复提醒模板变量缺失、消息内容提取格式、模板容错问题
 
-2. **📝 消息历史格式更新**
-   - 回退方案中的消息存储改用新版 `ContentPart` 列表格式，与 AstrBot 框架保持一致
+## v1.4.3
+- 兼容 AstrBot v4.12+ 新消息格式（ContentPart）
 
-## 🎉 v1.4.2 更新日志
+## v1.4.2
+- 日志优化、分段配置读取优化
 
-1. **🧾 日志优化**
-   - 将部分高频 `info` 输出调整为 `debug`，默认日志更清爽
-
-2. **📨 分段优化**
-   - 修复/优化分段配置读取逻辑，兼容 AstrBot 的 `get_config()`
-
-## 🎉 v1.4.1 更新日志
+## v1.4.1 更新日志
 
 ### 新增功能
 
@@ -73,17 +68,21 @@ Conversa 是一款为 AstrBot 设计的 **AI 定时主动续聊插件**，它能
 
 **可用的所有变量**：
 - `{now}` - 当前时间
-- `{time_since_last_chat}` - 🆕 距离上次用户发言过了多久
+- `{time_since_last_chat}` - 距离上次用户发言过了多久
 - `{last_user}` - 用户最后一条消息
 - `{last_ai}` - AI最后一条回复
 - `{umo}` - 会话ID
 
+</details>
+
 ## 🌟 核心特性
 
 - **⏰ 定时主动续聊**：支持延时触发和每日定时两种模式，AI 会在会话沉寂一段时间后主动发起新话题，或在每日特定时间点送上问候
-- **🧠 上下文记忆**：主动发送的消息会自动保存到对话历史，确保后续对话中 AI 能够记住并引用之前的主动回复内容，实现真正的上下文连续性
-- **👤 人格支持**：完整继承并使用 AstrBot 的人格系统（System Prompt），确保 AI 的每一句话都符合既定角色设定，支持会话专属人格和全局默认人格
-- **🔔 智能提醒**：用户可以通过自然语言设置一次性或每日提醒，AI 会在指定时间以符合人格的方式发出提醒，并自动记录到对话历史
+- **💬 对话增强**：AI 正常回复后有概率在短时间内追加一条主动消息，带指数递减防刷屏机制
+- **🧠 上下文记忆**：主动发送的消息会自动保存到对话历史（使用占位符节省 token），确保上下文连续性
+- **🤖 Agent 订阅**：支持 AI 通过 Agent 工具调用自动管理用户订阅，与手动命令兼容
+- **👤 人格支持**：完整继承并使用 AstrBot 的人格系统（System Prompt），确保 AI 的每一句话都符合既定角色设定
+- **🔔 智能提醒**：用户可以通过自然语言设置一次性或每日提醒，AI 会在指定时间以符合人格的方式发出提醒
 - **🌙 用户专属免打扰**：每个用户可以根据自己的作息时间设置个性化的免打扰时段，优先级高于全局设置
 - **🔄 自动重新激活**：因不活跃被自动退订的用户，再次主动发消息时将自动重新订阅，无需手动操作
 ---
@@ -160,17 +159,25 @@ AstrBot/
 | `daily.time2` | string | `""` | 每日触发时间 2（`HH:MM`）。若与 `time1` 相同会自动 **+1 分钟** 错峰。 |
 | `quiet_hours` | string | `""` | 免打扰时段（`HH:MM-HH:MM`），支持跨天。免打扰内不主动触发。 |
 | `history_depth` | int | `50` | 携带最近聊天条数（从当前会话历史提取）。 |
-| `idle_prompt_templates` | list | `[内置...` | **【v1.1 新增】**【间隔触发】的提示词模板列表（N分钟未回复时触发，从中随机选择）。 |
-| `daily_prompts` | object | `{...}` | **【v1.1 新增】**【每日定时触发】的三个时间点及其专属提示词。 |
+| `idle_prompt_templates` | list | `[内置...]` | 【间隔触发】的提示词模板列表（N分钟未回复时触发，从中随机选择）。 |
+| `daily_prompts` | object | `{...}` | 【每日定时触发】的三个时间点及其专属提示词。 |
 | `persona_override` | text | `""` | 覆盖默认人格的 System Prompt（留空使用当前会话人格）。 |
 | `max_no_reply_days` | int | `3` | 用户无回复多少天后自动退订（0表示不自动退订）。 |
 | `debug_mode` | bool | `false` | 调试模式：显示主动回复的完整上下文内容。 |
 | `append_time_field` | bool | `false` | 在主动消息前追加时间字段。 |
 | `time_format` | string | `"%Y-%m-%d %H:%M"` | 时间字段格式（Python `strftime`）。 |
-| `subscribe_mode` | string(`manual`/`auto`) | `manual` | 订阅方式：`manual` 需要手动 `/conversa watch`；`auto` 有互动即自动纳入。 |
+| `subscribe_mode` | string | `manual` | 订阅方式：`manual` 手动；`auto` 自动；`agent` 手动+AI工具调用。 |
+| `proactive_history_placeholder` | string | `[Conversa主动发起对话]` | **【v2.0 新增】** 主动回复写入历史时的占位符文本。 |
 | `reply_interval_seconds` | int | `20` | 多用户同时触发时的间隔秒数（避免API限流，推荐10-20）。 |
 | `subscribed_users` | list | `[]` | 订阅用户ID列表，支持在 WebUI 直接添加/删除。 |
-| `reminder_prompt_template` | text | `[见下文]` | **【v1.1 新增】** AI 主动提醒的提示词模板。必须包含 `{reminder_content}` 占位符。 |
+| `reminder_prompt_template` | text | `[见下文]` | AI 主动提醒的提示词模板。必须包含 `{reminder_content}` 占位符。 |
+| **对话增强 (enhancement)** | | | **【v2.0 新增】** |
+| `enable_enhancement` | bool | `false` | 启用对话增强（AI回复后概率追加主动消息）。 |
+| `enhancement_probability` | int | `20` | 触发概率 (0-100)。 |
+| `enhancement_min_delay` | int | `30` | 追回复最短延迟（秒）。 |
+| `enhancement_max_delay` | int | `1800` | 追回复最长延迟（秒），上限1800。 |
+| `enhancement_decay_rate` | float | `0.1` | 指数递减系数：连续主动回复时概率乘以此系数。 |
+| `enhancement_prompt_templates` | list | `[内置...]` | 追回复的提示词模板列表（随机选择）。 |
 | `_special.provider` | string | `""` | （可选）固定使用的 Provider ID，留空按会话默认。 |
 | `_special.persona` | string | `""` | （可选）固定人格 ID，留空按会话默认。 |
 
@@ -359,9 +366,10 @@ AstrBot/
 
 ## 🧾 版本信息
 
-**当前版本：v1.4.0** ⭐
+**当前版本：v2.0.0** ⭐
 
-## ✨ 更新日志
+<details>
+<summary>📁 完整历史更新日志</summary>
 
 ### **v1.4.0 (2025-01-XX) - API重构版**
 
@@ -464,6 +472,8 @@ AstrBot/
 - ✅ 定时提醒功能（一次性/每日提醒）
 - ✅ 调试模式（查看完整上下文）
 - ✅ 多用户触发优化（可配置间隔，避免API限流）
+
+</details>
 
 ---
 

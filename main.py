@@ -32,6 +32,18 @@ try:
 except ImportError:
     HAS_NEW_MESSAGE_API = False
 
+# 尝试导入 llm_tool（Agent 工具注册装饰器）
+try:
+    from astrbot.api import llm_tool
+    HAS_LLM_TOOL = True
+except ImportError:
+    # 兼容旧版本：提供空装饰器
+    def llm_tool(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    HAS_LLM_TOOL = False
+
 # 工具函数
 def _ensure_dir(p: str) -> str:
     """确保目录存在，不存在则创建"""
@@ -166,6 +178,8 @@ class SessionState:
     last_user_reply_ts: float = 0.0
     consecutive_no_reply_count: int = 0
     next_idle_ts: float = 0.0
+    enhancement_chain_count: int = 0  # 连续插件主动回复计数（用于指数递减）
+    last_proactive_reply_ts: float = 0.0  # 最近一次主动回复时间戳
     
     def __post_init__(self):
         """初始化后处理"""
@@ -182,7 +196,9 @@ class SessionState:
             "last_fired_tags": self.last_fired_tags if self.last_fired_tags else {},
             "last_user_reply_ts": self.last_user_reply_ts,
             "consecutive_no_reply_count": self.consecutive_no_reply_count,
-            "next_idle_ts": self.next_idle_ts
+            "next_idle_ts": self.next_idle_ts,
+            "enhancement_chain_count": self.enhancement_chain_count,
+            "last_proactive_reply_ts": self.last_proactive_reply_ts
         }
 
     @classmethod
@@ -197,7 +213,9 @@ class SessionState:
             last_fired_tags=tags_dict,
             last_user_reply_ts=data.get("last_user_reply_ts", 0.0),
             consecutive_no_reply_count=data.get("consecutive_no_reply_count", 0),
-            next_idle_ts=data.get("next_idle_ts", 0.0)
+            next_idle_ts=data.get("next_idle_ts", 0.0),
+            enhancement_chain_count=data.get("enhancement_chain_count", 0),
+            last_proactive_reply_ts=data.get("last_proactive_reply_ts", 0.0)
         )
     
     def has_fired(self, tag: str) -> bool:
@@ -250,7 +268,7 @@ class Reminder:
         )
 
 # 主插件类
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "1.4.4", 
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "2.0.0", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
@@ -270,6 +288,9 @@ class Conversa(Star):
         self._save_user_data_task: Optional[asyncio.Task] = None
         self._save_session_data_task: Optional[asyncio.Task] = None
         self._save_delay_seconds = 2.0  # 去抖延迟：2秒
+        
+        # 对话增强相关
+        self._enhancement_tasks: Dict[str, asyncio.Task] = {}
         
         # 数据文件路径（使用规范的方式获取插件数据目录）
         if HAS_STARTOOLS:
@@ -311,6 +332,18 @@ class Conversa(Star):
         # 启动后台调度器
         self._loop_task = asyncio.create_task(self._scheduler_loop())
         logger.info("[Conversa] Scheduler started.")
+        
+        # Agent 订阅工具：仅在 agent 模式下激活
+        if HAS_LLM_TOOL:
+            mode = self._get_cfg("basic_settings", "subscribe_mode") or "manual"
+            if mode == "agent":
+                self.context.activate_llm_tool("conversa_subscribe")
+                logger.info("[Conversa] Agent 订阅工具已激活")
+            else:
+                try:
+                    self.context.deactivate_llm_tool("conversa_subscribe")
+                except Exception:
+                    pass  # 工具可能未注册，忽略
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         """检查事件发送者是否为AstrBot管理员"""
@@ -532,14 +565,27 @@ class Conversa(Star):
         st = self._states[umo]
         profile = self._user_profiles[umo]
 
+        # 判断是否为有实际内容的真实消息（过滤输入状态等空事件）
+        message_text = event.message_str.strip() if hasattr(event, 'message_str') and event.message_str else ""
+        is_real_message = bool(message_text)
+
+        # 只有真实消息才取消待执行的对话增强任务
+        if is_real_message:
+            old_task = self._enhancement_tasks.pop(umo, None)
+            if old_task and not old_task.done():
+                old_task.cancel()
+
         # 保存旧的 last_user_reply_ts 用于判断是否是老用户
         old_last_user_reply_ts = st.last_user_reply_ts
 
         # 更新时间戳
         now_ts = _now_tz(self._get_cfg("basic_settings", "timezone") or None).timestamp()
         st.last_ts = now_ts
-        st.last_user_reply_ts = now_ts
+        if is_real_message:
+            st.last_user_reply_ts = now_ts
         st.consecutive_no_reply_count = 0
+        if is_real_message:
+            st.enhancement_chain_count = 0  # 用户发了真实消息，重置主动回复链计数
 
         # 自动订阅模式：仅在首次创建用户时自动订阅
         if (self._get_cfg("basic_settings", "subscribe_mode") or "manual") == "auto":
@@ -580,18 +626,52 @@ class Conversa(Star):
         await self._debounced_save_session_data()
         await self._debounced_save_user_data()
 
-    @filter.after_message_sent()
-    async def _after_message_sent(self, event: AstrMessageEvent):
-        """监听消息发送后事件，用于日志确认"""
+    @filter.on_llm_response()
+    async def _on_llm_response_enhancement(self, event: AstrMessageEvent):
+        """对话增强：LLM 回复后检查是否应触发短期追回复"""
         try:
-            # 框架会自动处理消息历史，我们只需要确认
-            if event._result and hasattr(event._result, "chain"):
-                message_text = "".join([i.text for i in event._result.chain if hasattr(i, "text")])
-                if message_text:
-                    logger.debug(f"[Conversa] 消息已发送: {message_text[:50]}...")
-            
+            umo = event.unified_msg_origin
+            if self._should_trigger_enhancement(umo):
+                self._schedule_enhancement(umo)
         except Exception as e:
-            logger.debug(f"[Conversa] 消息发送后处理: {e}")
+            logger.debug(f"[Conversa] 对话增强检查异常: {e}")
+
+    # Agent 订阅工具
+    @llm_tool(name="conversa_subscribe")
+    async def _tool_subscribe(self, event: AstrMessageEvent, action: str):
+        '''管理主动对话功能。当用户希望你能主动找他聊天、保持联系时开启；当用户明确不需要时关闭。
+
+        Args:
+            action(string): "on" 开启主动对话, "off" 关闭主动对话
+        '''
+        # 运行时检查：仅在 agent 模式下工作
+        mode = self._get_cfg("basic_settings", "subscribe_mode") or "manual"
+        if mode != "agent":
+            return "主动对话的订阅方式当前不是 agent 模式，无法通过工具操作。"
+        
+        umo = event.unified_msg_origin
+        if umo not in self._user_profiles:
+            self._user_profiles[umo] = UserProfile()
+        profile = self._user_profiles[umo]
+        
+        if action == "on":
+            profile.subscribed = True
+            profile.manual_unsubscribe = False
+            profile.auto_unsubscribed = False
+            logger.info(f"[Conversa] Agent 工具订阅: {umo}")
+            self._save_user_data()
+            self._sync_subscribed_users_to_config()
+            return "已开启主动对话订阅，我会在合适的时候主动找你聊天。"
+        elif action == "off":
+            profile.subscribed = False
+            profile.manual_unsubscribe = True
+            profile.auto_unsubscribed = False
+            logger.info(f"[Conversa] Agent 工具退订: {umo}")
+            self._save_user_data()
+            self._sync_subscribed_users_to_config()
+            return "已关闭主动对话订阅，我不会再主动发起聊天了。"
+        else:
+            return f"无效的操作 '{action}'，请使用 'on' 或 'off'。"
 
     @filter.command("conversa")
     async def _cmd_conversa(self, event: AstrMessageEvent):
@@ -937,6 +1017,120 @@ class Conversa(Star):
         # 使用换行符连接，确保每个提醒单独一行
         # 提示信息放在末尾，避免某些消息平台过滤括号内容
         return "提醒列表：\n" + "\n".join(lines)
+
+    # 对话增强（短期随机追回复）
+
+    def _should_trigger_enhancement(self, umo: str) -> bool:
+        """判断是否应该触发对话增强"""
+        try:
+            if not self.cfg.get("enable", True):
+                logger.debug("[Conversa] 对话增强跳过: 插件已禁用")
+                return False
+            
+            enable_val = self._get_cfg("enhancement", "enable_enhancement", False)
+            if not bool(enable_val):
+                logger.debug(f"[Conversa] 对话增强跳过: enable_enhancement={enable_val} (raw cfg enhancement={self.cfg.get('enhancement')})")
+                return False
+            
+            # 对话增强仅私聊生效
+            if "GroupMessage" in umo:
+                logger.debug("[Conversa] 对话增强跳过: 群聊不触发")
+                return False
+            
+            profile = self._user_profiles.get(umo)
+            if not profile or not profile.subscribed:
+                logger.debug(f"[Conversa] 对话增强跳过: 用户未订阅 (profile={profile is not None}, subscribed={profile.subscribed if profile else 'N/A'})")
+                return False
+            
+            # 注意：对话增强不检查免打扰，因为用户刚发了消息，说明正在聊天
+            
+            # 已有待执行的增强任务
+            if umo in self._enhancement_tasks and not self._enhancement_tasks[umo].done():
+                logger.debug("[Conversa] 对话增强跳过: 已有待执行任务")
+                return False
+            
+            # 计算概率（带指数递减）
+            base_prob = int(self._get_cfg("enhancement", "enhancement_probability") or 20)
+            st = self._states.get(umo)
+            if not st:
+                logger.debug("[Conversa] 对话增强跳过: 无 SessionState")
+                return False
+            
+            chain_count = st.enhancement_chain_count
+            
+            # 指数递减
+            decay_rate = float(self._get_cfg("enhancement", "enhancement_decay_rate") or 0.1)
+            effective_prob = base_prob * (decay_rate ** chain_count)
+            
+            roll = random.random() * 100
+            triggered = roll < effective_prob
+            
+            if triggered:
+                logger.info(f"[Conversa] 对话增强触发: {umo} (概率={effective_prob:.2f}%, chain={chain_count}, roll={roll:.2f})")
+            else:
+                logger.debug(f"[Conversa] 对话增强未触发: {umo} (概率={effective_prob:.2f}%, chain={chain_count}, roll={roll:.2f})")
+            
+            return triggered
+        except Exception as e:
+            logger.error(f"[Conversa] 对话增强判断出错: {e}")
+            return False
+
+    def _schedule_enhancement(self, umo: str):
+        """调度一个延迟的对话增强任务"""
+        min_delay = int(self._get_cfg("enhancement", "enhancement_min_delay") or 30)
+        max_delay = min(int(self._get_cfg("enhancement", "enhancement_max_delay") or 1800), 1800)
+        if min_delay > max_delay:
+            min_delay = max_delay
+        delay = random.randint(min_delay, max_delay)
+        
+        logger.info(f"[Conversa] 已调度对话增强: {umo}, {delay}秒后执行")
+        task = asyncio.create_task(self._delayed_enhancement(umo, delay))
+        self._enhancement_tasks[umo] = task
+
+    async def _delayed_enhancement(self, umo: str, delay: int):
+        """延迟执行对话增强回复"""
+        try:
+            # 记录触发时的用户最后消息时间戳
+            st = self._states.get(umo)
+            if not st:
+                return
+            trigger_user_ts = st.last_user_reply_ts
+            
+            await asyncio.sleep(delay)
+            
+            # 再次检查：用户是否在等待期间发了新消息
+            st = self._states.get(umo)
+            if not st:
+                return
+            if st.last_user_reply_ts > trigger_user_ts:
+                logger.debug(f"[Conversa] 对话增强取消: {umo} (用户在等待期间发了新消息)")
+                return
+            
+            # 检查订阅状态
+            profile = self._user_profiles.get(umo)
+            if not profile or not profile.subscribed:
+                return
+            
+            tz = self._get_cfg("basic_settings", "timezone") or None
+            
+            # 选择提示词模板
+            prompts = self._get_cfg("enhancement", "enhancement_prompt_templates") or []
+            if not prompts:
+                return
+            prompt_template = random.choice(prompts)
+            
+            hist_n = int(self._get_cfg("basic_settings", "history_depth") or 8)
+            logger.info(f"[Conversa] 执行对话增强回复: {umo}")
+            ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
+            if ok:
+                logger.info(f"[Conversa] 对话增强回复成功: {umo}")
+            
+        except asyncio.CancelledError:
+            logger.debug(f"[Conversa] 对话增强任务被取消: {umo}")
+        except Exception as e:
+            logger.error(f"[Conversa] 对话增强执行出错({umo}): {e}")
+        finally:
+            self._enhancement_tasks.pop(umo, None)
 
     # 调度器
     
@@ -1322,13 +1516,20 @@ class Conversa(Star):
             if not text.strip():
                 return False
             
+            # 清理插件标记（Conversa 绕过 pipeline，需手动清理）
+            text = self._clean_response_text(text)
+            
+            if not text.strip():
+                return False
+            
             # 添加时间戳（在存档到历史之前，保存原始文本用于发送）
             response_text = text
             if bool(self._get_cfg("basic_settings", "append_time_field")):
                 response_text = f"[{_fmt_now(self._get_cfg('basic_settings', 'time_format') or '%Y-%m-%d %H:%M', tz)}] " + text
             
-            # 手动将模拟的用户 prompt 和 AI 回复添加到对话历史
-            await self._add_message_pair_to_history(umo, curr_cid, conversation, prompt, response_text)
+            # 手动将模拟的用户 prompt 和 AI 回复添加到对话历史（使用占位符替代完整提示词）
+            placeholder = "[Conversa主动发起对话]"
+            await self._add_message_pair_to_history(umo, curr_cid, conversation, placeholder, response_text)
             
             # 发送消息
             await self._send_text(umo, response_text)
@@ -1340,6 +1541,8 @@ class Conversa(Star):
             profile = self._user_profiles.get(umo)
             if st and profile and profile.subscribed:
                 st.last_ts = now_ts
+                st.enhancement_chain_count += 1
+                st.last_proactive_reply_ts = now_ts
                 # 主动回复后使用去抖保存，减少磁盘I/O
                 await self._debounced_save_session_data()
             
@@ -1433,12 +1636,27 @@ class Conversa(Star):
             if not text.strip():
                 return False
 
-            # 手动将模拟的用户 prompt 和 AI 回复添加到对话历史
-            await self._add_message_pair_to_history(umo, curr_cid, conversation, prompt, text)
+            # 清理插件标记（Conversa 绕过 pipeline，需手动清理）
+            text = self._clean_response_text(text)
+            
+            if not text.strip():
+                return False
+
+            # 手动将模拟的用户 prompt 和 AI 回复添加到对话历史（使用占位符替代完整提示词）
+            placeholder = "[Conversa主动发起对话]"
+            await self._add_message_pair_to_history(umo, curr_cid, conversation, placeholder, text)
 
             # 发送提醒消息
             await self._send_reminder_message(umo, text)
             logger.info(f"[Conversa] 已发送 AI 提醒给 {umo}: {text[:50]}...")
+            
+            # 更新主动回复链计数
+            st = self._states.get(umo)
+            if st:
+                st.enhancement_chain_count += 1
+                st.last_proactive_reply_ts = _now_tz(tz).timestamp()
+                await self._debounced_save_session_data()
+            
             return True
 
         except Exception as e:
@@ -1771,6 +1989,33 @@ class Conversa(Star):
             logger.warning(f"[Conversa] 分段处理失败，使用原始文本: {e}")
             return [text]
     
+    # 回复文本清理
+
+    def _clean_response_text(self, text: str) -> str:
+        """清理 LLM 回复中的插件标记
+        
+        Conversa 的主动回复绕过了 AstrBot 事件 pipeline，
+        其他插件的 on_llm_resp hook 不会被触发，
+        因此需要按配置的正则清理标记，避免暴露给用户。
+        
+        清理模式可在配置 special.response_cleanup_pattern 中自定义。
+        默认匹配所有 [EnglishWord: content] 格式的插件标记。
+        """
+        pattern_str = (self.cfg.get("special") or {}).get(
+            "response_cleanup_pattern",
+            r"\s*\[[A-Za-z]+:[^\]]*\]\s*"
+        )
+        if not pattern_str:
+            return text
+        try:
+            cleaned = re.sub(pattern_str, '', text).strip()
+        except re.error as e:
+            logger.warning(f"[Conversa] 清理正则无效: {e}，跳过清理")
+            return text
+        if cleaned != text:
+            logger.debug("[Conversa] 已清理主动回复中的插件标记")
+        return cleaned
+
     async def _send_text(self, umo: str, text: str):
         """发送主动回复消息到指定会话"""
         try:
@@ -1823,6 +2068,12 @@ class Conversa(Star):
                 await self._loop_task
             except asyncio.CancelledError:
                 pass  # 预期的取消异常
+
+        # 取消所有对话增强任务
+        for umo, task in list(self._enhancement_tasks.items()):
+            if task and not task.done():
+                task.cancel()
+        self._enhancement_tasks.clear()
 
         logger.info("[Conversa] Performing final data save before termination...")
         if self._save_user_data_task and not self._save_user_data_task.done():

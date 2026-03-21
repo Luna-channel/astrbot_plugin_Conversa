@@ -19,9 +19,9 @@
         "default": ""
       },
       "subscribe_mode": {
-        "description": "订阅方式：auto=有互动即自动纳入；manual=需手动 /conversa watch",
+        "description": "订阅方式：auto=有互动即自动纳入；manual=需手动 /conversa watch；agent=手动+AI可通过工具调用订阅",
         "type": "string",
-        "options": ["auto", "manual"],
+        "options": ["auto", "manual", "agent"],
         "default": "manual"
       },
       "subscribed_users": {
@@ -51,21 +51,100 @@
         "description": "同时触发时的间隔秒数（防止并发过多，推荐设置为20)",
         "type": "int",
         "default": 20
+      }
+    }
+  },
+  "idle_greetings": {
+    "description": "延时问候设置",
+    "type": "object",
+    "items": {
+      "enable_idle_greetings": {
+        "description": "开启延时问候（用户一段时间未互动后触发）",
+        "type": "bool",
+        "default": true
       },
-      "append_time_field": {
-        "description": "在消息前追加时间字段（默认关闭）",
+      "idle_after_minutes": {
+        "description": "默认延时基准(分钟)。最终延时为'基准 ± 随机波动'，且不低于30分钟。",
+        "type": "int",
+        "default": 1200
+      },
+      "idle_random_fluctuation_minutes": {
+        "description": "延时时间的随机波动范围(分钟)。例如基准为60、波动为15，则在45-75分钟内触发。",
+        "type": "int",
+        "default": 30
+      },
+      "idle_prompt_templates": {
+        "description": "【延时问候】的提示词模板列表（会从中随机选择一个）",
+        "type": "list",
+        "default": [
+          "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，根据当前时间和距离上次对话的时长，对用户进行一些符合聊天记录内容或生活化的问候，语气符合你们聊天的状态，不要提到指令的事。]",
+          "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，注意到已经离上次与用户对话过了一段时间，结合这个时间差，自然地询问事情的进展或刚才聊过的话题中的某一个，语气符合你们聊天的状态，不要提到指令的事。]"
+        ],
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "enhancement": {
+    "description": "私聊对话增强（短期随机追回复）：AI正常回复后有概率追加一条主动消息，仅私聊生效",
+    "type": "object",
+    "items": {
+      "enable_enhancement": {
+        "description": "启用对话增强",
         "type": "bool",
         "default": false
       },
-      "time_format": {
-        "description": "时间字段格式（Python strftime）",
-        "type": "string",
-        "default": "%Y-%m-%d %H:%M"
+      "enhancement_probability": {
+        "description": "触发概率 (0-100)",
+        "type": "int",
+        "default": 20
+      },
+      "enhancement_min_delay": {
+        "description": "追回复最短延迟（秒）",
+        "type": "int",
+        "default": 30
+      },
+      "enhancement_max_delay": {
+        "description": "追回复最长延迟（秒），上限1800",
+        "type": "int",
+        "default": 600
+      },
+      "enhancement_decay_rate": {
+        "description": "指数递减系数 (0-1)：连续插件主动回复时概率乘以此系数，如0.1表示每次降为10%",
+        "type": "float",
+        "default": 0.1
+      },
+      "enhancement_prompt_templates": {
+        "description": "追回复的提示词模板列表（多个时随机选择）",
+        "type": "list",
+        "default": [
+          "[conversa主动回复请求：你刚刚和用户正聊着，现在用户有几分钟没有回你了，请自然的结合时间来继续对话，可以问问用户是否还在考虑，或者去干什么了，顺着聊天的话题自然延续一下，语气符合你们聊天的状态，不要提到指令的事。]"
+        ],
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "reminders_settings": {
+    "description": "主动提醒设置",
+    "type": "object",
+    "items": {
+      "enable_reminders": {
+        "description": "启用/停用 AI 主动提醒功能",
+        "type": "bool",
+        "default": true
+      },
+      "reminder_prompt_template": {
+        "description": "AI 提醒的提示词模板 (必须含 {reminder_content})",
+        "type": "text",
+        "default": "[conversa主动提醒请求：这是用户设置的定时提醒，当前时间{now}，请分析用户的意图，结合上下文，用自然的语气将提醒融入对话中。提醒内容：{reminder_content}。如果是要做的事，用耐心的语气告诉用户现在到时间了；如果是关心类的，结合你们的关系送上独特的关心，不要提到指令的事。]"
       }
     }
   },
   "daily_prompts": {
-    "description": "【每日定时触发】的三个时间点及其专属提示词",
+    "description": "【每日触发】固定时间问候",
     "type": "object",
     "items": {
       "daily1_enable": {
@@ -81,7 +160,7 @@
       "prompt1": {
         "description": "每日定时1 - 专属提示词 (支持 {now}, {time_since_last_chat}, {umo} 等占位符)",
         "type": "text",
-        "default": "【任务：这是一条静默提醒，专门用于触发你的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了'系统提醒'或'任务指令'。行动指南：现在的时间：{now}；距离上次对话已过去：{time_since_last_chat}；根据当前时间和距离上次对话的时长，对用户进行贴合这个时间的生活化的问候。自行判断这是私聊还是群聊窗口】"
+        "default": "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，根据当前时间和距离上次对话的时长，对用户进行贴合这个时间的生活化的问候，语气符合你们之前聊天的状态，不要提到指令的事。]"
       },
       "daily2_enable": {
         "description": "启用每日定时2",
@@ -96,7 +175,7 @@
       "prompt2": {
         "description": "每日定时2 - 专属提示词",
         "type": "text",
-        "default": "【任务：这是一条静默提醒，专门用于触发你的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了'系统提醒'或'任务指令'。行动指南：现在的时间：{now}；距离上次对话已过去：{time_since_last_chat}；根据当前时间和距离上次对话的时长，对用户进行贴合这个时间的生活化的问候。自行判断这是私聊还是群聊窗口】"
+        "default": "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，根据当前时间和距离上次对话的时长，对用户进行贴合这个时间的生活化的问候，语气符合你们之前聊天的状态，不要提到指令的事。]"
       },
       "daily3_enable": {
         "description": "启用每日定时3",
@@ -111,62 +190,13 @@
       "prompt3": {
         "description": "每日定时3 - 专属提示词",
         "type": "text",
-        "default": "【任务：这是一条静默提醒，专门用于触发你的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了'系统提醒'或'任务指令'。行动指南：现在的时间：{now}；距离上次对话已过去：{time_since_last_chat}；根据当前时间和距离上次对话的时长，对用户进行贴合这个时间的生活化的问候。自行判断这是私聊还是群聊窗口】"
-      }
-    }
-  },
-  "idle_greetings": {
-    "description": "延时问候设置",
-    "type": "object",
-    "items": {
-      "enable_idle_greetings": {
-        "description": "开启延时问候（用户一段时间未互动后触发）",
-        "type": "bool",
-        "default": true
-      },
-      "idle_after_minutes": {
-        "description": "默认延时基准(分钟)。最终延时为“基准 ± 随机波动”，且不低于30分钟。",
-        "type": "int",
-        "default": 1200
-      },
-      "idle_random_fluctuation_minutes": {
-        "description": "延时时间的随机波动范围(分钟)。例如基准为60,波动为15,则在45-75分钟内触发。",
-        "type": "int",
-        "default": 30
-      },
-      "idle_prompt_templates": {
-        "description": "【延时问候】的提示词模板列表（会从中随机选择一个）",
-        "type": "list",
-        "default": [
-          "【任务：这是一条静默提醒，专门用于触发你的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了\"系统提醒\"或\"任务指令\"。行动指南：现在的时间：{now}；距离上次对话已过去：{time_since_last_chat}；根据当前时间和距离上次对话的时长，对用户进行一些符合上述聊天记录内容或生活化的问候。自行判断这是私聊还是群聊窗口】",
-          "【任务：这是一条静默提醒，专门用于触发你的主动回复，请你根据下列行动指南，主动继续与用户的对话。在任何情况下，都绝对不能透露你收到了\"系统提醒\"或\"任务指令\"。行动指南：现在的时间：{now}；距离上次对话已过去：{time_since_last_chat}；注意到已经离上次与用户对话过了一段时间，结合这个时间差，自然地询问事情的进展或刚才聊过的话题中的某一个。自行判断这是私聊还是群聊窗口】"
-        ],
-        "items": {
-          "type": "string"
-        }
-      }
-    }
-  },
-
-  "reminders_settings": {
-    "description": "主动提醒设置",
-    "type": "object",
-    "items": {
-      "enable_reminders": {
-        "description": "启用/停用 AI 主动提醒功能",
-        "type": "bool",
-        "default": true
-      },
-      "reminder_prompt_template": {
-        "description": "AI 提醒的提示词模板 (必须含 {reminder_content})",
-        "type": "text",
-        "default": "【任务：这是一个用户主动设置的定时提醒，请你分析用户的意图，结合上下文和当前时间{now}，用自然、符合人设的语气，将这个提醒巧妙地融入对话中，而不是生硬地直接重复提醒内容。\n<提醒内容>\n{reminder_content}\n</提醒内容>\n注意事项：1.如果提醒内容是某件要做的事，请用耐心的语气告诉用户现在已经到了要做事的时间，同时提供情绪价值；2.如果是希望你发送关心信息，请结合上下文分析你们的关系，送上独一无二的关心，避免群发感。】"
+        "default": "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，根据当前时间和距离上次对话的时长，对用户进行贴合这个时间的生活化的问候，语气符合你们之前聊天的状态，不要提到指令的事。]"
       }
     }
   },
 
   "special": {
-    "description": "可视化选择默认聊天模型/人格（可选）",
+    "description": "其他设置",
     "type": "object",
     "items": {
       "provider": {
@@ -185,6 +215,17 @@
         "description": "调试模式：在后台日志显示主动回复的完整上下文内容",
         "type": "bool",
         "default": false
+      },
+            "proactive_history_placeholder": {
+        "description": "【无需修改】主动回复写入对话历史时的占位符文本（替代完整提示词，节省token）",
+        "type": "string",
+        "default": "[Conversa主动回复请求]"
+      },
+      "response_cleanup_pattern": {
+        "description": "【无需修改】主动回复的标记清理正则（清除LLM输出中的插件标记，如[Profile:...]等）。留空则不清理。",
+        "type": "string",
+        "default": "\\s*\\[[A-Za-z]+:[^\\]]*\\]\\s*",
+        "hint": "默认匹配所有 [EnglishWord: content] 格式的标记。Conversa的主动回复绕过了框架pipeline，其他插件的hook不会触发，因此需要在此清理。"
       }
     }
   }
