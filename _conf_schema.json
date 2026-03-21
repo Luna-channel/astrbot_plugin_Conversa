@@ -137,7 +137,7 @@
       },
       "enhancement_prompt_templates": {
         "description": "追回复提示词",
-        "hint": "多个模板时随机选择",
+        "hint": "多个模板时随机选择。支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai}",
         "type": "list",
         "default": [
           "[conversa主动回复请求：你刚刚和用户正聊着，现在用户有几分钟没有回你了，请自然的结合时间来继续对话，可以问问用户是否还在考虑，或者去干什么了，顺着聊天的话题自然延续一下，语气符合你们聊天的状态，不要提到指令的事。]"

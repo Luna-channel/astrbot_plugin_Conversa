@@ -1042,7 +1042,7 @@ class Conversa(Star):
                 logger.debug(f"[Conversa] 对话增强跳过: 用户未订阅 (profile={profile is not None}, subscribed={profile.subscribed if profile else 'N/A'})")
                 return False
             
-            # 注意：对话增强不检查免打扰，因为用户刚发了消息，说明正在聊天
+            # 调度时不检查免打扰（用户刚发了消息说明在线），执行时再检查
             
             # 已有待执行的增强任务
             if umo in self._enhancement_tasks and not self._enhancement_tasks[umo].done():
@@ -1112,6 +1112,14 @@ class Conversa(Star):
                 return
             
             tz = self._get_cfg("basic_settings", "timezone") or None
+            
+            # 执行时检查免打扰（延迟期间可能已进入免打扰时段）
+            now = _now_tz(tz)
+            quiet = self._get_cfg("basic_settings", "quiet_hours", "") or ""
+            user_quiet = profile.quiet_hours if profile.quiet_hours else quiet
+            if _in_quiet(now, user_quiet):
+                logger.debug(f"[Conversa] 对话增强取消: {umo} (当前处于免打扰时段)")
+                return
             
             # 选择提示词模板
             prompts = self._get_cfg("enhancement", "enhancement_prompt_templates") or []
