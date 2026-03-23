@@ -627,7 +627,7 @@ class Conversa(Star):
         await self._debounced_save_user_data()
 
     @filter.on_llm_response()
-    async def _on_llm_response_enhancement(self, event: AstrMessageEvent):
+    async def _on_llm_response_enhancement(self, event: AstrMessageEvent, _response=None):
         """对话增强：LLM 回复后检查是否应触发短期追回复"""
         try:
             umo = event.unified_msg_origin
