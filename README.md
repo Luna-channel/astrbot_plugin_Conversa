@@ -1,7 +1,7 @@
 # Conversa · AI 主动续聊插件 for AstrBot
 
 > **作者**：柯尔 (Luna-channel)  
-> **版本**：v2.0.0  
+> **版本**：v2.0.1  
 > **仓库**：<https://github.com/Luna-channel/astrbot_plugin_Conversa>  
 
 Conversa 是一款为 AstrBot 设计的 **AI 定时主动续聊插件**，它能够在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。
