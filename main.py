@@ -589,8 +589,11 @@ class Conversa(Star):
 
         # 自动订阅模式：仅在首次创建用户时自动订阅
         if (self._get_cfg("basic_settings", "subscribe_mode") or "manual") == "auto":
-            # 只在用户第一次发消息时（old_last_user_reply_ts == 0）自动订阅
-            if old_last_user_reply_ts == 0 and not profile.manual_unsubscribe:
+            # 检查是否为群聊，如果禁用了群聊自动订阅则跳过
+            is_group = "GroupMessage" in umo
+            if is_group and not bool(self._get_cfg("basic_settings", "auto_subscribe_group", False)):
+                logger.debug(f"[Conversa] 自动订阅跳过群聊: {umo} (auto_subscribe_group=false)")
+            elif old_last_user_reply_ts == 0 and not profile.manual_unsubscribe:
                 profile.subscribed = True
                 profile.auto_unsubscribed = False  # 清除自动退订标记
                 logger.info(f"[Conversa] 自动订阅模式：新用户 {umo} 已自动订阅")
@@ -600,11 +603,15 @@ class Conversa(Star):
         if not profile.subscribed and profile.auto_unsubscribed and not profile.manual_unsubscribe:
             auto_resubscribe = bool(self._get_cfg("basic_settings", "auto_resubscribe", True))
             if auto_resubscribe:
-                # 用户主动发消息，重新激活订阅
-                profile.subscribed = True
-                profile.auto_unsubscribed = False  # 清除自动退订标记
-                logger.info(f"[Conversa] 自动重新激活订阅: {umo} (用户在自动退订后主动聊天)")
-                self._sync_subscribed_users_to_config()  # 同步到配置文件
+                # 群聊自动重新激活也受 auto_subscribe_group 控制
+                is_group = "GroupMessage" in umo
+                if is_group and not bool(self._get_cfg("basic_settings", "auto_subscribe_group", False)):
+                    logger.debug(f"[Conversa] 自动重新激活跳过群聊: {umo} (auto_subscribe_group=false)")
+                else:
+                    profile.subscribed = True
+                    profile.auto_unsubscribed = False  # 清除自动退订标记
+                    logger.info(f"[Conversa] 自动重新激活订阅: {umo} (用户在自动退订后主动聊天)")
+                    self._sync_subscribed_users_to_config()  # 同步到配置文件
 
 
         # 计算下一次延时问候触发时间

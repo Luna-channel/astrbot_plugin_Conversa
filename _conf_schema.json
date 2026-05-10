@@ -29,6 +29,12 @@
         "options": ["auto", "manual", "agent"],
         "default": "manual"
       },
+      "auto_subscribe_group": {
+        "description": "自动订阅群聊",
+        "hint": "在自动订阅模式下，是否也将群聊消息纳入自动订阅（关闭后仅私聊自动订阅）",
+        "type": "bool",
+        "default": false
+      },
       "subscribed_users": {
         "description": "订阅用户列表",
         "hint": "用户 ID 列表，支持直接添加/删除",
