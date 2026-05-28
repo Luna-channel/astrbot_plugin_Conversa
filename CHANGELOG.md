@@ -1,4 +1,71 @@
 # Conversa 更新日志
+
+## v3.0.0 (2026-05-28)
+
+---
+
+> ## ⚠️ 重要提醒：旧版用户请执行迁移指令
+>
+> 如果你从 v2.x 升级，且使用过 `/conversa remind` 设置过提醒，请在 AstrBot 聊天中执行：
+>
+> ```
+> /conversa migrate-reminders
+> ```
+>
+> **此指令会将你所有的旧提醒一次性迁移到 AstrBot 原生定时任务系统。旧数据保留不删除，可继续通过 /conversa remind 管理。可重复执行，已迁移的会自动跳过。**
+
+---
+
+### 核心改造：主动回复走官方 Agent Pipeline
+
+v3 最大的变化是主动回复不再绕过框架。之前的版本直接调用 `provider.text_chat()` 裸调 LLM，导致没有 Agent 工具调用、没有其他插件 hook、没有框架级人格注入。
+
+v3 改为使用 AstrBot 框架的 `CronMessageEvent` + `build_main_agent()` 走完整 Agent Pipeline，与框架自己的 cron 系统用的是同一套方案。
+
+**改造前后对比：**
+
+| 维度 | v2 | v3 |
+|---|---|---|
+| 主动回复调用方式 | `provider.text_chat()` 裸调 | `CronMessageEvent` + `build_main_agent()` |
+| Agent 工具调用 | 不支持 | 完整支持 |
+| 其他插件 hook | 不触发 | 正常触发 |
+| 人格注入 | 手动获取，容易出错 | 框架自动处理 |
+| 对话历史加载 | 三级降级手动解析 | 框架自动加载 |
+| 对话历史保存 | 手动写占位符 | `persist_agent_history()` 自动保存 |
+| 旧版本框架兼容 | - | 自动降级到 `provider.text_chat()` |
+
+### 配置项整理
+
+- 删除 `special` 配置组（3 个从未生效的死配置 + 1 个改造后不需要的清理正则）
+- `special.provider` 迁移到 `advanced.fixed_provider`
+- `persona_override`、`history_depth` 移入 `advanced` 高级设置组
+- `reminders_settings`（命令式提醒）标记为待废弃，引导使用 AstrBot 原生定时提醒
+- `daily_prompts` 标记为旧功能（仍有独特价值：对所有订阅用户触发）
+- 更新各功能组的描述文案
+
+### 删除的代码
+
+删除了 8 个因走官方 Pipeline 而不再需要的方法（共约 220 行）：
+
+- `_get_system_prompt()` — 框架自动处理人格
+- `_safe_get_full_contexts()` 及其 4 个辅助方法 — 框架自动加载历史
+- `_normalize_messages()` / `_extract_content_text()` — 消息格式兼容层
+- `_clean_response_text()` — 走 Pipeline 后不需要手动清理插件标记
+
+### 新增的代码
+
+- `_run_agent_pipeline()` — 通过 `CronMessageEvent` + `build_main_agent()` 执行完整 Agent Pipeline
+- `_run_legacy_llm()` — 旧版本框架降级方案
+- `_get_last_messages()` — 从官方 conversation 历史提取最近消息（供占位符使用）
+- `_migrate_config()` — 自动迁移旧版配置到新位置
+- `_migrate_reminders_to_cron()` — 将旧版提醒迁移到 AstrBot 原生 cron 系统（管理员指令触发）
+- `/conversa migrate-reminders` — 管理员迁移指令，幂等可重复执行
+
+### 向后兼容
+
+- 框架 API 不可用时自动降级到旧的 `provider.text_chat()` 方式
+- 旧版配置（`special.provider`、`basic_settings.fixed_provider` 等）在启动时自动迁移
+- `/conversa remind` 命令功能保留，但推荐使用 AstrBot 原生定时提醒
 ## v2.0.1 (2026-03-29)
 
 ### 🐛 Bug修复 

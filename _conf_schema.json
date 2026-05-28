@@ -10,18 +10,6 @@
     "type": "object",
     "hint": "插件核心参数配置",
     "items": {
-      "timezone": {
-        "description": "时区",
-        "hint": "IANA 时区格式，留空使用系统时区。例如 Asia/Shanghai、America/Los_Angeles",
-        "type": "string",
-        "default": ""
-      },
-      "quiet_hours": {
-        "description": "免打扰时段",
-        "hint": "该时段内不触发主动回复，格式 HH:MM-HH:MM，支持跨天（如 23:00-07:00）",
-        "type": "string",
-        "default": ""
-      },
       "subscribe_mode": {
         "description": "订阅方式",
         "hint": "auto=有互动即自动纳入；manual=需手动 /conversa watch；agent=手动+AI可通过工具调用订阅",
@@ -31,68 +19,69 @@
       },
       "subscribed_users": {
         "description": "订阅用户列表",
-        "hint": "用户 ID 列表，支持直接添加/删除",
+        "hint": "已订阅用户的会话 ID，支持在此直接添加/删除",
         "type": "list",
         "default": [],
         "items": {
           "type": "string"
         }
       },
+      "quiet_hours": {
+        "description": "免打扰时段",
+        "hint": "该时段内不触发任何主动回复，格式 HH:MM-HH:MM，支持跨天（如 23:00-07:00）",
+        "type": "string",
+        "default": ""
+      },
       "max_no_reply_days": {
         "description": "自动退订天数",
-        "hint": "用户无回复多少天后自动退订，0 表示不自动退订",
+        "hint": "用户连续多少天未回复后自动退订，0 表示不自动退订",
         "type": "int",
         "default": 3
       },
-      "persona_override": {
-        "description": "自定义人格覆盖",
-        "hint": "如果最下方的人格配置没有生效，可手动将人格设置复制到此处",
-        "type": "text",
-        "default": ""
-      },
-      "history_depth": {
-        "description": "聊天记录条数",
-        "hint": "拼接最近聊天记录的条数（从当前对话历史中提取）",
-        "type": "int",
-        "default": 50
-      },
       "reply_interval_seconds": {
         "description": "回复间隔（秒）",
-        "hint": "同时触发多个主动回复时的间隔秒数，防止并发过多，推荐 20 秒",
+        "hint": "同一轮调度中多个主动回复之间的间隔秒数，防止短时间内发送过多消息",
         "type": "int",
         "default": 20
+      },
+      "timezone": {
+        "description": "时区",
+        "hint": "IANA 时区格式，留空使用系统时区。例如 Asia/Shanghai、America/Los_Angeles",
+        "type": "string",
+        "default": ""
       }
     }
   },
   "idle_greetings": {
-    "description": "延时问候",
+    "description": "沉寂问候",
     "type": "object",
-    "hint": "用户一段时间未互动后自动触发问候",
+    "hint": "与用户最后一次聊天结束后，经过一段时间的沉寂，AI 会主动发起一条问候消息。每轮对话后必定触发一次。",
     "items": {
       "enable_idle_greetings": {
-        "description": "启用延时问候",
+        "description": "启用沉寂问候",
+        "hint": "开启后，每次对话结束沉寂一段时间后 AI 会主动来找用户聊天",
         "type": "bool",
         "default": true
       },
       "idle_after_minutes": {
-        "description": "延时基准（分钟）",
-        "hint": "最终延时 = 基准 ± 随机波动，且不低于 30 分钟",
+        "description": "沉寂基准时间（分钟）",
+        "hint": "与用户最后一次聊天之后等待多少分钟触发问候。最终触发时间 = 基准 +- 随机波动，最低 30 分钟",
         "type": "int",
         "default": 1200
       },
       "idle_random_fluctuation_minutes": {
         "description": "随机波动（分钟）",
-        "hint": "延时时间的随机波动范围。例如基准 60、波动 15，则在 45-75 分钟内触发",
+        "hint": "触发时间的随机浮动范围。例如基准 60、波动 15，则实际在 45~75 分钟之间触发",
         "type": "int",
         "default": 30
       },
       "idle_prompt_templates": {
-        "description": "延时问候提示词",
-        "hint": "多个模板时随机选择。支持占位符: {now} {time_since_last_chat}",
+        "description": "问候提示词模板",
+        "hint": "触发时随机选择一个模板。支持占位符: {now} {time_since_last_chat} {last_user} {last_ai} {umo}",
         "type": "list",
         "default": [
-          "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，根据当前时间和距离上次对话的时长，对用户进行一些符合聊天记录内容或生活化的问候，语气符合你们聊天的状态，不要提到指令的事。]",
-          "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，注意到已经离上次与用户对话过了一段时间，结合这个时间差，自然地询问事情的进展或刚才聊过的话题中的某一个，语气符合你们聊天的状态，不要提到指令的事。]"
+          "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，根据当前时间和距离上次对话的时长，对用户进行一些符合聊天记录内容或生活化的问候，语气符合你们聊天的状态，不要提到指令的事。注意，这个提醒是系统定时触发的，不是用户发送的消息，不要假定是用户找你。]",
+          "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，注意到已经离上次与用户对话过了一段时间，结合这个时间差，自然地询问事情的进展或刚才聊过的话题中的某一个，语气符合你们聊天的状态，不要提到指令的事。注意，这个提醒是系统定时触发的，不是用户发送的消息，不要假定是用户找你。]"
         ],
         "items": {
           "type": "string"
@@ -103,41 +92,41 @@
   "enhancement": {
     "description": "私聊对话增强",
     "type": "object",
-    "hint": "AI 正常回复后有概率追加一条主动消息，仅私聊生效",
+    "hint": "AI 正常回复用户后，短时间内有概率主动追加一条消息，像真人聊天一样自然接话，提升活人感。仅私聊生效。",
     "items": {
       "enable_enhancement": {
         "description": "启用对话增强",
-        "hint": "开启后 AI 回复用户时有概率追加一条主动消息",
+        "hint": "开启后，每次 AI 回复用户后有一定概率在短时间内追发一条消息",
         "type": "bool",
         "default": false
       },
       "enhancement_probability": {
-        "description": "触发概率",
-        "hint": "0-100 的整数，每次 AI 回复后以此概率触发追回复",
+        "description": "触发概率（%）",
+        "hint": "0~100，每次 AI 回复后以此概率触发接话。连续触发时概率会按递减系数衰减",
         "type": "int",
         "default": 20
       },
       "enhancement_min_delay": {
-        "description": "最短延迟（秒）",
-        "hint": "追回复的最短等待时间",
+        "description": "最短等待（秒）",
+        "hint": "触发后至少等待多少秒再发送",
         "type": "int",
         "default": 30
       },
       "enhancement_max_delay": {
-        "description": "最长延迟（秒）",
-        "hint": "追回复的最长等待时间，上限 1800 秒",
+        "description": "最长等待（秒）",
+        "hint": "触发后最多等待多少秒再发送，上限 1800",
         "type": "int",
         "default": 600
       },
       "enhancement_decay_rate": {
         "description": "递减系数",
-        "hint": "连续追回复时概率乘以此系数（0-1）。如 0.1 表示每次降为上次的 10%",
+        "hint": "连续接话时概率的衰减倍率（0~1）。如 0.1 表示第二次概率降为首次的 10%，第三次降为 1%",
         "type": "float",
         "default": 0.1
       },
       "enhancement_prompt_templates": {
-        "description": "追回复提示词",
-        "hint": "多个模板时随机选择。支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai}",
+        "description": "接话提示词模板",
+        "hint": "触发时随机选择一个模板。支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai}",
         "type": "list",
         "default": [
           "[conversa主动回复请求：你刚刚和用户正聊着，现在用户有几分钟没有回你了，请自然的结合时间来继续对话，可以问问用户是否还在考虑，或者去干什么了，顺着聊天的话题自然延续一下，语气符合你们聊天的状态，不要提到指令的事。]"
@@ -148,28 +137,10 @@
       }
     }
   },
-  "reminders_settings": {
-    "description": "主动提醒",
-    "type": "object",
-    "hint": "AI 定时提醒功能，用户可通过命令设置提醒",
-    "items": {
-      "enable_reminders": {
-        "description": "启用主动提醒",
-        "type": "bool",
-        "default": true
-      },
-      "reminder_prompt_template": {
-        "description": "提醒提示词模板",
-        "hint": "必须包含 {reminder_content} 占位符。还支持: {now}",
-        "type": "text",
-        "default": "[conversa主动提醒请求：这是用户设置的定时提醒，当前时间{now}，请分析用户的意图，结合上下文，用自然的语气将提醒融入对话中。提醒内容：{reminder_content}。如果是要做的事，用耐心的语气告诉用户现在到时间了；如果是关心类的，结合你们的关系送上独特的关心，不要提到指令的事。]"
-      }
-    }
-  },
   "daily_prompts": {
-    "description": "每日定时问候",
+    "description": "每日定时问候（旧功能）",
     "type": "object",
-    "hint": "在固定时间触发问候，最多 3 个时间点",
+    "hint": "旧功能：在每天的固定时间点对所有订阅用户触发一次问候消息，最多可配置 3 个时间点。",
     "items": {
       "daily1_enable": {
         "description": "启用定时 1",
@@ -184,7 +155,7 @@
       },
       "prompt1": {
         "description": "定时 1 提示词",
-        "hint": "支持占位符: {now} {time_since_last_chat} {umo}",
+        "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai}",
         "type": "text",
         "default": "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，根据当前时间和距离上次对话的时长，对用户进行贴合这个时间的生活化的问候，语气符合你们之前聊天的状态，不要提到指令的事。]"
       },
@@ -201,7 +172,7 @@
       },
       "prompt2": {
         "description": "定时 2 提示词",
-        "hint": "支持占位符: {now} {time_since_last_chat} {umo}",
+        "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai}",
         "type": "text",
         "default": "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，根据当前时间和距离上次对话的时长，对用户进行贴合这个时间的生活化的问候，语气符合你们之前聊天的状态，不要提到指令的事。]"
       },
@@ -218,49 +189,53 @@
       },
       "prompt3": {
         "description": "定时 3 提示词",
-        "hint": "支持占位符: {now} {time_since_last_chat} {umo}",
+        "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai}",
         "type": "text",
         "default": "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，根据当前时间和距离上次对话的时长，对用户进行贴合这个时间的生活化的问候，语气符合你们之前聊天的状态，不要提到指令的事。]"
       }
     }
   },
-
-  "special": {
+  "advanced": {
     "description": "高级设置",
     "type": "object",
     "hint": "一般无需修改",
     "items": {
-      "provider": {
-        "description": "固定 Provider",
-        "hint": "为空则按当前会话的 Provider",
+      "fixed_provider": {
+        "description": "固定 LLM Provider",
+        "hint": "指定主动回复使用的 LLM Provider ID，留空则跟随当前会话设置",
         "type": "string",
         "default": "",
         "_special": "select_provider"
       },
-      "persona": {
-        "description": "固定人格",
-        "hint": "为空则按当前会话的人格",
-        "type": "string",
-        "default": "",
-        "_special": "select_persona"
+      "persona_override": {
+        "description": "人格覆盖",
+        "hint": "非空时强制覆盖框架的人格设置，仅对 Conversa 主动回复生效。留空则使用框架默认人格。",
+        "type": "text",
+        "default": ""
       },
-      "debug_mode": {
-        "description": "调试模式",
-        "hint": "在后台日志显示主动回复的完整上下文内容",
+      "history_depth": {
+        "description": "历史条数（降级模式）",
+        "hint": "仅在框架 Agent Pipeline 不可用的降级模式下生效，控制传给 LLM 的历史消息条数。正常模式下由框架自动管理。",
+        "type": "int",
+        "default": 50
+      }
+    }
+  },
+  "reminders_settings": {
+    "description": "命令式提醒（待废弃）",
+    "type": "object",
+    "hint": "⚠️ 此功能即将废弃。推荐直接对 AI 说「提醒我...」使用 AstrBot 原生定时提醒。已有提醒可通过 /conversa migrate-reminders 指令一次性迁移到原生系统。",
+    "items": {
+      "enable_reminders": {
+        "description": "启用命令式提醒",
         "type": "bool",
-        "default": false
+        "default": true
       },
-      "proactive_history_placeholder": {
-        "description": "历史占位符【无需修改】",
-        "hint": "主动回复写入对话历史时用此文本替代完整提示词，节省 token",
-        "type": "string",
-        "default": "[Conversa主动回复请求]"
-      },
-      "response_cleanup_pattern": {
-        "description": "标记清理正则【无需修改】",
-        "type": "string",
-        "default": "\\s*\\[[A-Za-z]+:[^\\]]*\\]\\s*",
-        "hint": "默认匹配所有 [EnglishWord: content] 格式的标记。Conversa的主动回复绕过了框架pipeline，其他插件的hook不会触发，因此需要在此清理。"
+      "reminder_prompt_template": {
+        "description": "提醒提示词模板",
+        "hint": "必须包含 {reminder_content}。还支持: {now} {time_since_last_chat} {last_user} {last_ai} {umo}",
+        "type": "text",
+        "default": "[conversa主动提醒请求：注意，这个提醒是系统定时触发的，不是用户发送的消息，不要假定是用户找你。当前时间{now}，这是用户之前设置的定时提醒，请结合上下文，用自然的语气将提醒融入对话中。提醒内容：{reminder_content}。如果是要做的事，用耐心的语气告诉用户现在到时间了；如果是关心类的，结合你们的关系送上独特的关心，不要提到指令的事。]"
       }
     }
   }

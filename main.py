@@ -44,6 +44,17 @@ except ImportError:
         return decorator
     HAS_LLM_TOOL = False
 
+# 导入官方 Agent Pipeline API（用于主动回复走合规调用）
+try:
+    from astrbot.core.cron.events import CronMessageEvent
+    from astrbot.core.astr_main_agent import build_main_agent, MainAgentBuildConfig
+    from astrbot.core.provider.entities import ProviderRequest
+    from astrbot.core.platform.message_session import MessageSession
+    from astrbot.core.utils.history_saver import persist_agent_history
+    HAS_AGENT_PIPELINE = True
+except ImportError:
+    HAS_AGENT_PIPELINE = False
+
 # 工具函数
 def _ensure_dir(p: str) -> str:
     """确保目录存在，不存在则创建"""
@@ -268,7 +279,7 @@ class Reminder:
         )
 
 # 主插件类
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "2.0.1", 
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "3.0", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
@@ -326,6 +337,120 @@ class Conversa(Star):
         self._load_user_data()
         self._load_session_data()
         self._sync_subscribed_users_from_config()
+        self._migrate_config()
+
+    def _migrate_config(self):
+        """一次性配置迁移：旧位置 -> 新位置"""
+        try:
+            changed = False
+            advanced = self.cfg.get("advanced") or {}
+            basic = self.cfg.get("basic_settings") or {}
+
+            # special.provider -> advanced.fixed_provider
+            special = self.cfg.get("special")
+            if isinstance(special, dict) and special.get("provider"):
+                if not advanced.get("fixed_provider"):
+                    advanced["fixed_provider"] = special["provider"]
+                    changed = True
+                    logger.info("[Conversa] 已迁移 special.provider -> advanced.fixed_provider")
+
+            # basic_settings.fixed_provider -> advanced.fixed_provider
+            if basic.get("fixed_provider") and not advanced.get("fixed_provider"):
+                advanced["fixed_provider"] = basic["fixed_provider"]
+                changed = True
+                logger.info("[Conversa] 已迁移 basic_settings.fixed_provider -> advanced.fixed_provider")
+
+            # basic_settings.persona_override -> advanced.persona_override
+            if basic.get("persona_override") and not advanced.get("persona_override"):
+                advanced["persona_override"] = basic["persona_override"]
+                changed = True
+                logger.info("[Conversa] 已迁移 basic_settings.persona_override -> advanced.persona_override")
+
+            if changed:
+                self.cfg["advanced"] = advanced
+                self.cfg.save_config()
+        except Exception as e:
+            logger.debug(f"[Conversa] 配置迁移检查: {e}")
+
+    async def _migrate_reminders_to_cron(self) -> str:
+        """将旧版 Conversa 提醒迁移到 AstrBot 原生 cron 系统（幂等，重复执行安全）"""
+        if not self._reminders:
+            return "没有需要迁移的提醒。"
+        cron_mgr = getattr(self.context, "cron_manager", None)
+        if not cron_mgr:
+            return "❌ cron_manager 不可用，无法迁移。"
+
+        # 预取已有 jobs 用于幂等检查
+        existing_jobs = await cron_mgr.list_jobs()
+        existing_map = {j.name: j for j in existing_jobs}
+
+        migrated = 0
+        failed = 0
+        for rid, reminder in list(self._reminders.items()):
+            try:
+                at = reminder.at
+                umo = reminder.umo
+                content = reminder.content
+
+                job_name = f"conversa_migrate_{rid}"
+                template = self._get_cfg("reminders_settings", "reminder_prompt_template") or "提醒内容：{reminder_content}"
+                note = template.replace("{reminder_content}", content)
+
+                # 构建正确的 cron 表达式或一次性参数
+                is_daily = "|daily" in at
+                cron_expr = None
+                run_at = None
+                if is_daily:
+                    hhmm = at.split("|", 1)[0]
+                    t = _parse_hhmm(hhmm)
+                    if not t:
+                        failed += 1
+                        continue
+                    cron_expr = f"{t[1]} {t[0]} * * *"
+                else:
+                    try:
+                        run_at = datetime.strptime(at, "%Y-%m-%d %H:%M")
+                    except ValueError:
+                        failed += 1
+                        continue
+
+                # 幂等检查：同名 job 已存在则删除重建（覆盖）
+                existing = existing_map.get(job_name)
+                if existing:
+                    await cron_mgr.delete_job(existing.job_id)
+
+                if is_daily:
+                    await cron_mgr.add_active_job(
+                        name=job_name,
+                        cron_expression=cron_expr,
+                        payload={"session": umo, "note": note, "origin": "conversa_migrate"},
+                        description=f"[Conversa迁移] {content[:60]}",
+                        run_once=False,
+                    )
+                else:
+                    await cron_mgr.add_active_job(
+                        name=job_name,
+                        cron_expression=None,
+                        payload={"session": umo, "note": note, "origin": "conversa_migrate"},
+                        description=f"[Conversa迁移] {content[:60]}",
+                        run_once=True,
+                        run_at=run_at,
+                    )
+                migrated += 1
+
+            except Exception as e:
+                logger.error(f"[Conversa] 迁移提醒 {rid} 失败: {e}")
+                failed += 1
+
+        parts = []
+        if migrated > 0:
+            parts.append(f"✅ 已迁移 {migrated} 个提醒到 AstrBot 原生定时任务")
+            parts.append("旧数据已保留，可继续通过 /conversa remind 管理")
+        if failed > 0:
+            parts.append(f"❌ {failed} 个迁移失败")
+        if not parts:
+            parts.append("没有需要迁移的提醒。")
+        return "\n".join(parts)
 
     async def initialize(self):
         """插件激活时的初始化方法（框架生命周期）"""
@@ -888,9 +1013,9 @@ class Conversa(Star):
                     return
                 try:
                     depth = int(value)
-                    settings = self.cfg.get("basic_settings") or {}
+                    settings = self.cfg.get("advanced") or {}
                     settings["history_depth"] = depth
-                    self.cfg["basic_settings"] = settings
+                    self.cfg["advanced"] = settings
                     self.cfg.save_config()
                     yield reply(f"🧵 已设置历史条数：{depth}")
                 except ValueError:
@@ -900,16 +1025,26 @@ class Conversa(Star):
             yield reply(f"❌ 未知的 set 目标 '{target}'。可用: after, daily[1-3], quiet, history。")
             return
 
-        # remind 命令
+        # migrate-reminders 命令（管理员）
+        if sub_command == "migrate-reminders":
+            if not self._is_admin(event):
+                yield reply("错误：此命令仅限管理员使用。")
+                return
+            result = await self._migrate_reminders_to_cron()
+            yield reply(result)
+            return
+
+        # remind 命令（旧功能，推荐使用 AstrBot 原生定时提醒）
         if sub_command == "remind":
             if not bool(self._get_cfg("reminders_settings", "enable_reminders", True)):
-                yield reply("提醒功能已被管理员禁用。")
+                yield reply("提醒功能已被管理员禁用。\n💡 推荐直接对 AI 说「提醒我...」使用 AstrBot 原生定时提醒。")
                 return
             
             remind_sub_command = args[1].lower() if len(args) > 1 else ""
 
             if remind_sub_command == "list":
-                yield reply(self._remind_list_text(event.unified_msg_origin))
+                list_text = self._remind_list_text(event.unified_msg_origin)
+                yield reply(f"{list_text}\n\n💡 提示：推荐直接对 AI 说「提醒我...」使用 AstrBot 原生定时提醒。")
                 return
             
             if remind_sub_command == "del" and len(args) >= 3:
@@ -960,7 +1095,7 @@ class Conversa(Star):
                         created_at=datetime.now().timestamp()
                     )
                     self._save_user_data()
-                    yield reply(f"⏰ 已添加一次性提醒 {rid}")
+                    yield reply(f"⏰ 已添加一次性提醒 {rid}\n💡 提示：推荐直接对 AI 说「提醒我...」使用 AstrBot 原生定时提醒。")
                     return
                 elif m_daily:
                     hhmm, content = m_daily.groups()
@@ -972,7 +1107,7 @@ class Conversa(Star):
                         created_at=datetime.now().timestamp()
                     )
                     self._save_user_data()
-                    yield reply(f"⏰ 已添加每日提醒 {rid}")
+                    yield reply(f"⏰ 已添加每日提醒 {rid}\n💡 提示：推荐直接对 AI 说「提醒我...」使用 AstrBot 原生定时提醒。")
                     return
             
             yield reply(self._help_text())
@@ -991,11 +1126,8 @@ class Conversa(Star):
             "/conversa set after <小时> - x小时后主动问候（最低0.5）\n"
             "/conversa set quiet <HH:MM-HH:MM> - 设置您的专属免打扰时间\n"
             "/conversa set quiet <HH:MM-HH:MM> global - (管理员)设置全局免打扰\n"
-            "/conversa remind <add/list/del> [参数...]\n"
-            "  - add <HH:MM> <提醒内容> - 添加每日提醒\n"
-            "  - add <YYYY-MM-DD HH:MM> <提醒内容> - 添加一次性提醒\n"
-            "  - list - 显示当前会话的所有提醒\n"
-            "  - del <序号> - 删除指定序号的提醒"
+            "/conversa remind <add/list/del> [参数...] - (旧功能)管理提醒\n"
+            "/conversa migrate-reminders - (管理员)迁移旧提醒到 AstrBot 原生定时任务"
         )
 
     def _get_user_reminders_sorted(self, umo: str) -> List[Reminder]:
@@ -1127,7 +1259,7 @@ class Conversa(Star):
                 return
             prompt_template = random.choice(prompts)
             
-            hist_n = int(self._get_cfg("basic_settings", "history_depth") or 8)
+            hist_n = int(self._get_cfg("advanced", "history_depth") or 8)
             logger.info(f"[Conversa] 执行对话增强回复: {umo}")
             ok = await self._proactive_reply(umo, hist_n, tz, prompt_template)
             if ok:
@@ -1182,7 +1314,7 @@ class Conversa(Star):
         tz = self._get_cfg("basic_settings", "timezone") or None
         now = _now_tz(tz)
         quiet = self._get_cfg("basic_settings", "quiet_hours", "") or ""
-        hist_n = int(self._get_cfg("basic_settings", "history_depth") or 8)
+        hist_n = int(self._get_cfg("advanced", "history_depth") or 8)
         reply_interval = int(self._get_cfg("basic_settings", "reply_interval_seconds") or 10)
 
         # 解析每日定时配置（修复：使用 slot1/slot2/slot3 而非 time1/time2/time3）
@@ -1432,528 +1564,311 @@ class Conversa(Star):
         """
         执行主动回复的核心方法
         
-        完整流程：
-        1. 获取 LLM Provider
-        2. 获取当前对话对象
-        3. 获取人格/系统提示词（多策略降级）
-        4. 获取完整上下文历史
-        5. 格式化提示词模板
-        6. 调用 LLM
-        7. 发送消息并更新状态
+        v3 改造：通过官方 CronMessageEvent + build_main_agent 走合规 Agent Pipeline，
+        支持完整的工具调用、人格注入、历史管理。
+        当框架 API 不可用时降级到旧的 provider.text_chat 方式。
         """
         try:
-            # 获取 Provider
-            fixed_provider = (self.cfg.get("special") or {}).get("provider") or ""
-            provider = None
-            if fixed_provider:
-                provider = self.context.get_provider_by_id(fixed_provider)
-            if not provider:
-                provider = self.context.get_using_provider(umo=umo)
-            if not provider:
-                logger.warning(f"[Conversa] provider missing for {umo}")
-                return False
-            
-            # 获取 Conversation
-            conv_mgr = self.context.conversation_manager
-            curr_cid = await conv_mgr.get_curr_conversation_id(umo)
-            conversation = await conv_mgr.get_conversation(umo, curr_cid)
-            
-            # 获取 System Prompt
-            system_prompt = await self._get_system_prompt(umo, conversation)
-            if not system_prompt:
-                logger.warning(f"[Conversa] 未能获取任何 system_prompt，将使用空值")  # noqa: F541
-            
-            # 获取上下文
-            contexts: List[Dict] = []
-            try:
-                contexts = await self._safe_get_full_contexts(umo, conversation)
-                if contexts and hist_n > 0:
-                    contexts = contexts[-hist_n:]
-                logger.info(f"[Conversa] 为 {umo} 获取到 {len(contexts)} 条上下文")
-            except Exception as e:
-                logger.error(f"[Conversa] 获取上下文时出错: {e}")
-                contexts = []
-            
-            # 格式化提示词
-            if prompt_template:
-                last_user = ""
-                last_ai = ""
-                for m in reversed(contexts):
-                    role = m.get("role", "")
-                    content = m.get("content", "")
-                    # 处理 content 可能是列表格式的情况（新版 AstrBot）
-                    if isinstance(content, list):
-                        content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
-                    content = str(content)[:100]  # 限制长度
-                    if not last_user and role == "user":
-                        last_user = content
-                    if not last_ai and role == "assistant":
-                        last_ai = content
-                    if last_user and last_ai:
-                        break
-                
-                # 计算距离上次聊天的时间
-                st = self._states.get(umo)
-                time_since_last_chat = "未知"
-                if st and st.last_user_reply_ts > 0:
-                    now_ts = _now_tz(tz).timestamp()
-                    time_delta = now_ts - st.last_user_reply_ts
-                    time_since_last_chat = _format_time_delta(time_delta)
-                
-                prompt = prompt_template.format(
-                    now=_fmt_now(self._get_cfg("basic_settings", "time_format") or "%Y-%m-%d %H:%M", tz),
-                    last_user=last_user,
-                    last_ai=last_ai,
-                    umo=umo,
-                    time_since_last_chat=time_since_last_chat
-                )
-            else:
-                prompt = "请自然地延续对话，与用户继续交流。"
-            
-            # 记录关键信息
-            logger.info(f"[Conversa] 准备主动回复 {umo}，上下文: {len(contexts)}条，系统提示词: {'已获取' if system_prompt else '空'}")
-            
-            # 调用 LLM 生成回复
-            llm_resp = await provider.text_chat(
-                prompt=prompt,
-                contexts=contexts,
-                system_prompt=system_prompt or ""
-            )
-            text = llm_resp.completion_text if hasattr(llm_resp, "completion_text") else ""
-            
-            if not text.strip():
-                return False
-            
-            # 清理插件标记（Conversa 绕过 pipeline，需手动清理）
-            text = self._clean_response_text(text)
-            
-            if not text.strip():
-                return False
-            
-            # 添加时间戳（在存档到历史之前，保存原始文本用于发送）
-            response_text = text
-            if bool(self._get_cfg("basic_settings", "append_time_field")):
-                response_text = f"[{_fmt_now(self._get_cfg('basic_settings', 'time_format') or '%Y-%m-%d %H:%M', tz)}] " + text
-            
-            # 手动将模拟的用户 prompt 和 AI 回复添加到对话历史（使用占位符替代完整提示词）
-            placeholder = "[Conversa主动发起对话]"
-            await self._add_message_pair_to_history(umo, curr_cid, conversation, placeholder, response_text)
-            
-            # 发送消息
-            await self._send_text(umo, response_text)
-            logger.info(f"[Conversa] 已发送主动回复给 {umo}: {response_text[:50]}...")
-            
-            # 更新状态
-            now_ts = _now_tz(tz).timestamp()
-            st = self._states.get(umo)
-            profile = self._user_profiles.get(umo)
-            if st and profile and profile.subscribed:
-                st.last_ts = now_ts
-                st.enhancement_chain_count += 1
-                st.last_proactive_reply_ts = now_ts
-                # 主动回复后使用去抖保存，减少磁盘I/O
-                await self._debounced_save_session_data()
-            
-            return True
-        
-        except Exception as e:
-            logger.error(f"[Conversa] proactive error({umo}): {e}")
-            return False
-    
-    async def _proactive_reminder_reply(self, umo: str, reminder_content: str) -> bool:
-        """执行由 AI 生成的主动提醒回复"""
-        try:
-            hist_n = int(self._get_cfg("basic_settings", "history_depth") or 8)
-            
-            # 获取 Provider
-            fixed_provider = (self.cfg.get("special") or {}).get("provider") or ""
-            provider = self.context.get_provider_by_id(fixed_provider) if fixed_provider else self.context.get_using_provider(umo=umo)
-            if not provider:
-                logger.warning(f"[Conversa] reminder provider missing for {umo}")
-                return False
+            # --- 格式化 prompt（保留原有的占位符替换逻辑） ---
+            now = _now_tz(tz)
+            time_fmt = self._get_cfg("basic_settings", "time_format") or "%Y-%m-%d %H:%M"
+            now_str = now.strftime(time_fmt)
 
-            # 获取 Conversation
-            conv_mgr = self.context.conversation_manager
-            curr_cid = await conv_mgr.get_curr_conversation_id(umo)
-            conversation = await conv_mgr.get_conversation(umo, curr_cid)
-
-            # 获取 System Prompt
-            system_prompt = await self._get_system_prompt(umo, conversation)
-
-            # 获取上下文
-            contexts = await self._safe_get_full_contexts(umo, conversation)
-            if contexts and hist_n > 0:
-                contexts = contexts[-hist_n:]
-
-            # 构造提醒专用的 Prompt
-            prompt_template = self._get_cfg("reminders_settings", "reminder_prompt_template") or "用户提醒：{reminder_content}"
-            
-            # 计算距离上次聊天的时间（供模板使用）
-            tz = self._get_cfg("basic_settings", "timezone")
             st = self._states.get(umo)
             time_since_last_chat = "未知"
             if st and st.last_user_reply_ts > 0:
-                now_ts = _now_tz(tz).timestamp()
-                time_delta = now_ts - st.last_user_reply_ts
+                time_delta = now.timestamp() - st.last_user_reply_ts
                 time_since_last_chat = _format_time_delta(time_delta)
-            
-            # 获取最近的对话内容（供模板使用）
-            last_user = ""
-            last_ai = ""
-            if contexts:
-                for ctx in reversed(contexts):
-                    role = ctx.get("role", "")
-                    content = ctx.get("content", "")
-                    if isinstance(content, list):
-                        content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
-                    if role == "user" and not last_user:
-                        last_user = str(content)[:100]
-                    elif role == "assistant" and not last_ai:
-                        last_ai = str(content)[:100]
-                    if last_user and last_ai:
-                        break
-            
-            # 使用安全的format方式，提供所有可能用到的变量
+
+            last_user, last_ai = await self._get_last_messages(umo)
+
+            if prompt_template:
+                try:
+                    prompt = prompt_template.format(
+                        now=now_str,
+                        last_user=last_user,
+                        last_ai=last_ai,
+                        umo=umo,
+                        time_since_last_chat=time_since_last_chat
+                    )
+                except KeyError as e:
+                    logger.warning(f"[Conversa] prompt 模板格式化失败，未知占位符: {e}")
+                    prompt = prompt_template
+            else:
+                prompt = "请自然地延续对话，与用户继续交流。"
+
+            logger.info(f"[Conversa] 准备主动回复 {umo}")
+
+            # --- 走官方 Agent Pipeline ---
+            if HAS_AGENT_PIPELINE:
+                response_text = await self._run_agent_pipeline(umo, prompt, tz)
+            else:
+                # 降级：旧版本框架不支持 CronMessageEvent
+                response_text = await self._run_legacy_llm(umo, prompt)
+
+            if not response_text:
+                return False
+
+            # 发送消息（如果 Agent 没有通过工具自行发送）
+            if not getattr(self, '_last_cron_event_sent', False):
+                await self._send_text(umo, response_text)
+            logger.info(f"[Conversa] 已发送主动回复给 {umo}: {response_text[:50]}...")
+
+            # --- 更新状态 ---
+            now_ts = now.timestamp()
+            if umo not in self._states:
+                self._states[umo] = SessionState()
+            st = self._states[umo]
+            st.last_ts = now_ts
+            st.enhancement_chain_count += 1
+            st.last_proactive_reply_ts = now_ts
+            await self._debounced_save_session_data()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"[Conversa] proactive error({umo}): {e}", exc_info=True)
+            return False
+
+    async def _run_agent_pipeline(self, umo: str, prompt: str, tz: Optional[str] = None) -> Optional[str]:
+        """通过官方 CronMessageEvent + build_main_agent 执行 Agent Pipeline"""
+        self._last_cron_event_sent = False
+
+        session = MessageSession.from_str(umo)
+        cron_event = CronMessageEvent(
+            context=self.context,
+            session=session,
+            message=prompt,
+        )
+
+        # 构建 Agent 配置（与框架 cron 系统一致）
+        config = MainAgentBuildConfig(
+            tool_call_timeout=120,
+            llm_safety_mode=False,
+            streaming_response=False,
+        )
+
+        # 固定 provider（如果配置了）
+        fixed_provider_id = self._get_cfg("advanced", "fixed_provider", "") or ""
+        provider = None
+        if fixed_provider_id:
+            provider = self.context.get_provider_by_id(fixed_provider_id)
+
+        # 人格覆盖（如果配置了，传给 ProviderRequest 的 system_prompt）
+        persona_override = (self._get_cfg("advanced", "persona_override") or "").strip()
+        req = None
+        if persona_override:
+            req = ProviderRequest()
+            req.prompt = prompt
+            req.system_prompt = persona_override
+
+        result = await build_main_agent(
+            event=cron_event,
+            plugin_context=self.context,
+            config=config,
+            provider=provider,
+            req=req,
+        )
+
+        if not result or not result.agent_runner:
+            logger.warning(f"[Conversa] build_main_agent 返回空结果: {umo}")
+            return None
+
+        runner = result.agent_runner
+        async for _ in runner.step_until_done(30):
+            pass
+
+        llm_resp = runner.get_final_llm_resp()
+        if not llm_resp or not llm_resp.completion_text:
+            logger.debug(f"[Conversa] Agent 无文本响应: {umo}")
+            return None
+
+        response_text = llm_resp.completion_text.strip()
+        if not response_text:
+            return None
+
+        # 记录 Agent 是否已通过工具发送了消息
+        self._last_cron_event_sent = getattr(cron_event, '_has_send_oper', False)
+
+        # 保存对话历史（与框架 cron 系统一致）
+        try:
+            summary = f"[Conversa主动发起对话] {response_text[:100]}"
+            await persist_agent_history(
+                self.context.conversation_manager,
+                event=cron_event,
+                req=result.provider_request,
+                summary_note=summary,
+            )
+        except Exception as e:
+            logger.warning(f"[Conversa] persist_agent_history 失败: {e}")
+
+        return response_text
+
+    async def _run_legacy_llm(self, umo: str, prompt: str) -> Optional[str]:
+        """降级方案：直接调用 provider.text_chat()（旧版本框架兼容）"""
+        fixed_provider_id = self._get_cfg("advanced", "fixed_provider", "") or ""
+        provider = None
+        if fixed_provider_id:
+            provider = self.context.get_provider_by_id(fixed_provider_id)
+        if not provider:
+            provider = self.context.get_using_provider(umo=umo)
+        if not provider:
+            logger.warning(f"[Conversa] provider missing for {umo}")
+            return None
+
+        self._last_cron_event_sent = False
+
+        llm_resp = await provider.text_chat(
+            prompt=prompt,
+            contexts=[],
+            system_prompt=""
+        )
+        text = llm_resp.completion_text if hasattr(llm_resp, "completion_text") else ""
+        return text.strip() if text else None
+    
+    async def _proactive_reminder_reply(self, umo: str, reminder_content: str) -> bool:
+        """
+        执行由 AI 生成的主动提醒回复
+        
+        v3 改造：复用 _run_agent_pipeline / _run_legacy_llm，走合规调用。
+        """
+        try:
+            tz = self._get_cfg("basic_settings", "timezone") or None
+            now = _now_tz(tz)
+            time_fmt = self._get_cfg("basic_settings", "time_format") or "%Y-%m-%d %H:%M"
+            now_str = now.strftime(time_fmt)
+
+            st = self._states.get(umo)
+            time_since_last_chat = "未知"
+            if st and st.last_user_reply_ts > 0:
+                time_delta = now.timestamp() - st.last_user_reply_ts
+                time_since_last_chat = _format_time_delta(time_delta)
+
+            last_user, last_ai = await self._get_last_messages(umo)
+
+            # 使用提醒 prompt 模板
+            template = self._get_cfg("reminders_settings", "reminder_prompt_template") or "用户提醒：{reminder_content}"
             try:
-                prompt = prompt_template.format(
+                prompt = template.format(
                     reminder_content=reminder_content,
-                    now=_fmt_now(
-                        self._get_cfg("basic_settings", "time_format") or "%Y-%m-%d %H:%M",
-                        tz
-                    ),
+                    now=now_str,
                     umo=umo,
                     time_since_last_chat=time_since_last_chat,
                     last_user=last_user,
                     last_ai=last_ai
                 )
             except KeyError as e:
-                # 如果模板中有未知的占位符，使用默认模板
                 logger.warning(f"[Conversa] 提醒模板格式化失败，未知占位符: {e}，使用默认模板")
                 prompt = f"用户提醒：{reminder_content}"
 
             logger.info(f"[Conversa] 触发 AI 提醒 for {umo}: {reminder_content}")
 
-            # 调用 LLM 生成提醒回复
-            llm_resp = await provider.text_chat(
-                prompt=prompt,
-                contexts=contexts,
-                system_prompt=system_prompt or ""
-            )
-            text = llm_resp.completion_text if hasattr(llm_resp, "completion_text") else ""
+            # 走官方 Agent Pipeline 或降级
+            if HAS_AGENT_PIPELINE:
+                response_text = await self._run_agent_pipeline(umo, prompt, tz)
+            else:
+                response_text = await self._run_legacy_llm(umo, prompt)
 
-            if not text.strip():
+            if not response_text:
                 return False
 
-            # 清理插件标记（Conversa 绕过 pipeline，需手动清理）
-            text = self._clean_response_text(text)
-            
-            if not text.strip():
-                return False
+            # 发送消息（如果 Agent 没有通过工具自行发送）
+            if not getattr(self, '_last_cron_event_sent', False):
+                await self._send_text(umo, response_text)
+            logger.info(f"[Conversa] 已发送 AI 提醒给 {umo}: {response_text[:50]}...")
 
-            # 手动将模拟的用户 prompt 和 AI 回复添加到对话历史（使用占位符替代完整提示词）
-            placeholder = "[Conversa主动发起对话]"
-            await self._add_message_pair_to_history(umo, curr_cid, conversation, placeholder, text)
+            # 更新状态
+            if umo not in self._states:
+                self._states[umo] = SessionState()
+            st = self._states[umo]
+            st.enhancement_chain_count += 1
+            st.last_proactive_reply_ts = _now_tz(tz).timestamp()
+            await self._debounced_save_session_data()
 
-            # 发送提醒消息
-            await self._send_reminder_message(umo, text)
-            logger.info(f"[Conversa] 已发送 AI 提醒给 {umo}: {text[:50]}...")
-            
-            # 更新主动回复链计数
-            st = self._states.get(umo)
-            if st:
-                st.enhancement_chain_count += 1
-                st.last_proactive_reply_ts = _now_tz(tz).timestamp()
-                await self._debounced_save_session_data()
-            
             return True
 
         except Exception as e:
-            logger.error(f"[Conversa] proactive reminder error({umo}): {e}")
+            logger.error(f"[Conversa] proactive reminder error({umo}): {e}", exc_info=True)
             return False
 
     async def _add_message_pair_to_history(self, umo: str, conversation_id: str, conversation, user_prompt: str, assistant_response: str):
         """
-        将模拟的用户 prompt 和 AI 回复添加到对话历史
+        将消息对添加到对话历史（使用官方 API）
         
-        优先使用新版本的 add_message_pair API（如果可用），否则回退到旧的手动操作方式。
-        新API的优势：
-        1. 使用框架标准API，更规范
-        2. 框架内部可能优化，减少不必要的事件触发
-        3. 代码更简洁，维护性更好
+        注意：走 build_main_agent + persist_agent_history 的主动回复已经自动保存历史，
+        此方法仅用于降级路径或其他需要手动追加历史的场景。
         """
         try:
-            # 检查 conversation_id 是否有效
             if not conversation_id:
                 logger.warning("[Conversa] conversation_id 为空，无法更新历史")
                 return
-            
+
             conv_mgr = self.context.conversation_manager
-            
-            # 优先使用新版本的 add_message_pair API
+
             if HAS_NEW_MESSAGE_API:
                 try:
-                    # 使用新的Message模型
                     user_msg = UserMessageSegment(content=[TextPart(text=user_prompt)])
-                    assistant_msg = AssistantMessageSegment(
-                        content=[TextPart(text=assistant_response)]
-                    )
-                    
+                    assistant_msg = AssistantMessageSegment(content=[TextPart(text=assistant_response)])
                     await conv_mgr.add_message_pair(
                         cid=conversation_id,
                         user_message=user_msg,
                         assistant_message=assistant_msg,
                     )
-                    
-                    logger.info(f"[Conversa] ✅ 已使用新API添加消息对到历史：user({len(user_prompt)}字符) + assistant({len(assistant_response)}字符)")
+                    logger.debug(f"[Conversa] 已添加消息对到历史: {conversation_id}")
                     return
-                    
-                except AttributeError:
-                    # add_message_pair 方法不存在，回退到旧方法
-                    logger.debug("[Conversa] add_message_pair 方法不可用，回退到旧方法")
                 except Exception as e:
-                    logger.warning(f"[Conversa] 使用新API失败，回退到旧方法: {e}")
-            
-            # 回退方案：使用旧的手动操作方式（兼容旧版本astrbot）
-            conversation = await conv_mgr.get_conversation(umo, conversation_id)
-            if not conversation:
-                logger.warning("[Conversa] 无法获取 conversation 对象")
-                return
-            
-            # 参考 issue反馈的解决方案：直接使用 conversation.history（JSON字符串）
-            current_history = []
-            if hasattr(conversation, "history") and conversation.history:
-                try:
-                    # conversation.history 是 JSON 字符串，需要解析
-                    current_history = json.loads(conversation.history)
-                    if not isinstance(current_history, list):
-                        logger.warning("[Conversa] 解析后的 history 不是列表格式")
-                        current_history = []
-                    logger.info(f"[Conversa] 从 conversation.history 获取到 {len(current_history)} 条历史记录")
-                except json.JSONDecodeError as e:
-                    logger.warning(f"[Conversa] 无法解析 history JSON: {e}")
-                    current_history = []
-            else:
-                logger.info("[Conversa] conversation.history 为空，将创建新历史")
-                current_history = []
-            
-            # 1. 存档我们模拟的 "user" 消息（使用新格式 ContentPart 列表）
-            user_record = {"role": "user", "content": [{"type": "text", "text": user_prompt}]}
-            current_history.append(user_record)
-            
-            # 2. 存档 AI 生成的 "assistant" 消息（使用新格式 ContentPart 列表）
-            assistant_record = {"role": "assistant", "content": [{"type": "text", "text": assistant_response}]}
-            current_history.append(assistant_record)
-            
-            logger.info(f"[Conversa] 准备更新历史，当前历史记录数: {len(current_history)}")
-            
-            # 3. 将包含了完整"一问一答"的新历史，写回数据库
-            # 根据官方文档：update_conversation(unified_msg_origin, conversation_id, history, title, persona_id)
-            await conv_mgr.update_conversation(
-                unified_msg_origin=umo,
-                conversation_id=conversation_id,
-                history=current_history
+                    logger.warning(f"[Conversa] add_message_pair 失败: {e}")
+
+            # 降级：使用 dict 格式
+            await conv_mgr.add_message_pair(
+                cid=conversation_id,
+                user_message={"role": "user", "content": user_prompt},
+                assistant_message={"role": "assistant", "content": assistant_response},
             )
-            
-            logger.info(f"[Conversa] ✅ 已使用旧方法添加消息对到历史：user({len(user_prompt)}字符) + assistant({len(assistant_response)}字符)，总记录数: {len(current_history)}")
-            
-        except Exception as e:
-            logger.error(f"[Conversa] ❌ 添加消息对到历史失败: {e}", exc_info=True)
-            # 不抛出异常，允许继续执行发送消息的操作
+            logger.debug(f"[Conversa] 已添加消息对到历史(dict): {conversation_id}")
 
-    async def _get_system_prompt(self, umo: str, conversation) -> str:
-        """获取系统提示词，支持配置覆盖和降级策略"""
-        # 优先使用配置覆盖
-        persona_override = (self._get_cfg("basic_settings", "persona_override") or "").strip()
-        if persona_override:
-            return persona_override
-        
-        # 使用人格管理器获取提示词
-        try:
-            persona_mgr = getattr(self.context, "persona_manager", None)
-            if not persona_mgr:
-                return ""
-            
-            # 1. 尝试会话专属人格
-            if conversation and getattr(conversation, "persona_id", None):
-                persona = await persona_mgr.get_persona(conversation.persona_id)
-                if persona and getattr(persona, "system_prompt", None):
-                    logger.debug(f"[Conversa] 使用会话人格: {conversation.persona_id}")
-                    return persona.system_prompt
-            
-            # 2. 使用默认人格
-            default_persona = await persona_mgr.get_default_persona_v3(umo=umo)
-            if default_persona and default_persona.get("prompt"):
-                logger.debug(f"[Conversa] 使用默认人格: {default_persona.get('name', 'Unknown')}")
-                return default_persona["prompt"]
-                
         except Exception as e:
-            logger.warning(f"[Conversa] 获取系统提示词失败: {e}")
-        
-        return ""
+            logger.error(f"[Conversa] 添加消息对到历史失败: {e}", exc_info=True)
 
-    async def _safe_get_full_contexts(self, umo: str, conversation=None) -> List[Dict]:
-        """安全获取完整上下文，使用多重降级策略确保稳定性"""
-        contexts = []
-        
-        # 策略1：从传入的conversation对象获取
-        contexts = await self._try_get_from_conversation(conversation)
-        if contexts:
-            logger.debug(f"[Conversa] ✅ 策略1成功: 获取{len(contexts)}条历史")
-            return contexts
-        
-        # 策略2：通过conversation_manager重新获取
-        contexts = await self._try_get_from_manager(umo)
-        if contexts:
-            logger.debug(f"[Conversa] ✅ 策略2成功: 获取{len(contexts)}条历史")
-            return contexts
-        
-        logger.warning(f"[Conversa] ⚠️ 无法获取 {umo} 的对话历史，将使用空上下文")
-        return []
-    
-    async def _try_get_from_conversation(self, conversation) -> List[Dict]:
-        """尝试从conversation对象获取历史"""
-        if not conversation:
-            return []
-        
-        # 尝试多种数据源
-        sources = [
-            ("messages", lambda: getattr(conversation, "messages", None)),
-            ("get_messages", lambda: self._safe_call(conversation.get_messages) if hasattr(conversation, "get_messages") else None),
-            ("history", lambda: getattr(conversation, "history", None))
-        ]
-        
-        for source_name, getter in sources:
-            try:
-                data = await getter() if asyncio.iscoroutinefunction(getter) else getter()
-                if data:
-                    contexts = self._extract_contexts_from_data(data)
-                    if contexts:
-                        logger.debug(f"[Conversa] 从{source_name}获取{len(contexts)}条历史")
-                        return contexts
-            except Exception as e:
-                logger.debug(f"[Conversa] {source_name}获取失败: {e}")
-        
-        return []
-    
-    async def _try_get_from_manager(self, umo: str) -> List[Dict]:
-        """尝试通过conversation_manager获取历史"""
+    async def _get_last_messages(self, umo: str) -> Tuple[str, str]:
+        """从官方 conversation 历史中获取最近的 user 和 assistant 消息（供占位符使用）"""
+        last_user = ""
+        last_ai = ""
         try:
-            if not hasattr(self.context, "conversation_manager"):
-                return []
-            
             conv_mgr = self.context.conversation_manager
-            conversation_id = await conv_mgr.get_curr_conversation_id(umo)
-            if not conversation_id:
-                return []
-            
-            conversation = await conv_mgr.get_conversation(umo, conversation_id)
-            return await self._try_get_from_conversation(conversation)
-        
-        except Exception as e:
-            logger.debug(f"[Conversa] conversation_manager获取失败: {e}")
-            return []
-    
-    def _extract_contexts_from_data(self, data) -> List[Dict]:
-        """从各种数据格式中提取上下文"""
-        if isinstance(data, str):
-            try:
-                parsed = json.loads(data)
-                return self._normalize_messages(parsed)
-            except json.JSONDecodeError:
-                return []
-        elif isinstance(data, list):
-            return self._normalize_messages(data)
-        elif hasattr(data, '__iter__'):
-            try:
-                return self._normalize_messages(list(data))
-            except Exception:
-                return []
-        return []
-    
-    async def _safe_call(self, func, *args, **kwargs):
-        """安全调用可能是异步的函数"""
-        try:
-            if asyncio.iscoroutinefunction(func):
-                return await func(*args, **kwargs)
-            return func(*args, **kwargs)
-        except Exception:
-            return None
-    
-    def _normalize_messages(self, msgs) -> List[Dict]:
-        """标准化消息格式，兼容多种数据源
-        
-        支持的消息格式：
-        1. 旧格式：{"role": "user", "content": "Hello"}
-        2. 新格式（ContentPart列表）：{"role": "user", "content": [{"type": "text", "text": "Hello"}]}
-        3. 嵌套结构：{"messages": [...]}
-        """
-        if not msgs:
-            return []
-        
-        # 处理嵌套结构
-        if isinstance(msgs, dict) and "messages" in msgs:
-            msgs = msgs["messages"]
-        
-        if not isinstance(msgs, list):
-            return []
-        
-        normalized = []
-        for msg in msgs:
-            if not isinstance(msg, dict):
-                continue
-            
-            # 提取角色
-            role = msg.get("role") or msg.get("speaker") or msg.get("from")
-            if role not in ("user", "assistant", "system"):
-                continue
-            
-            # 提取内容（兼容新旧格式）
-            content = self._extract_content_text(msg)
-            
-            # 验证并添加
-            if content:
-                normalized.append({"role": role, "content": content.strip()})
-        
-        return normalized
-    
-    def _extract_content_text(self, msg: dict) -> str:
-        """从消息中提取文本内容，兼容新旧格式
-        
-        新版 AstrBot 的 content 可能是：
-        1. str: 直接的文本内容（旧格式）
-        2. list[ContentPart]: [{"type": "text", "text": "..."}, {"type": "think", "think": "..."}]
-        3. None: 空内容（如纯工具调用消息）
-        """
-        raw_content = msg.get("content")
-        
-        # 情况1：字符串格式（旧格式，直接返回）
-        if isinstance(raw_content, str):
-            return raw_content
-        
-        # 情况2：列表格式（新格式 ContentPart 列表）
-        if isinstance(raw_content, list):
-            text_parts = []
-            for part in raw_content:
-                if not isinstance(part, dict):
+            curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+            if not curr_cid:
+                return last_user, last_ai
+
+            conversation = await conv_mgr.get_conversation(umo, curr_cid)
+            if not conversation or not conversation.history:
+                return last_user, last_ai
+
+            history = json.loads(conversation.history) if isinstance(conversation.history, str) else conversation.history
+            if not isinstance(history, list):
+                return last_user, last_ai
+
+            for msg in reversed(history):
+                if not isinstance(msg, dict):
                     continue
-                part_type = part.get("type", "")
-                # 提取 TextPart 的文本
-                if part_type == "text" and part.get("text"):
-                    text_parts.append(str(part["text"]))
-                # 也可以选择性提取 ThinkPart（思考内容），但通常不包含在对话历史中
-                # elif part_type == "think" and part.get("think"):
-                #     text_parts.append(f"[思考: {part['think']}]")
-            
-            if text_parts:
-                return " ".join(text_parts)
-        
-        # 情况3：尝试其他备选字段（向后兼容）
-        fallback = msg.get("text") or msg.get("message") or ""
-        if isinstance(fallback, str):
-            return fallback
-        
-        return ""
-    
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        p.get("text", "") for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                content = str(content)[:200]
+                if role == "user" and not last_user:
+                    last_user = content
+                elif role == "assistant" and not last_ai:
+                    last_ai = content
+                if last_user and last_ai:
+                    break
+        except Exception as e:
+            logger.debug(f"[Conversa] 获取最近消息失败: {e}")
+        return last_user, last_ai
+
     def _apply_segmentation(self, text: str) -> list[str]:
         """应用分段回复逻辑（模拟 AstrBot 的分段正则处理）
         
@@ -1996,33 +1911,6 @@ class Conversa(Star):
         except Exception as e:
             logger.warning(f"[Conversa] 分段处理失败，使用原始文本: {e}")
             return [text]
-    
-    # 回复文本清理
-
-    def _clean_response_text(self, text: str) -> str:
-        """清理 LLM 回复中的插件标记
-        
-        Conversa 的主动回复绕过了 AstrBot 事件 pipeline，
-        其他插件的 on_llm_resp hook 不会被触发，
-        因此需要按配置的正则清理标记，避免暴露给用户。
-        
-        清理模式可在配置 special.response_cleanup_pattern 中自定义。
-        默认匹配所有 [EnglishWord: content] 格式的插件标记。
-        """
-        pattern_str = (self.cfg.get("special") or {}).get(
-            "response_cleanup_pattern",
-            r"\s*\[[A-Za-z]+:[^\]]*\]\s*"
-        )
-        if not pattern_str:
-            return text
-        try:
-            cleaned = re.sub(pattern_str, '', text).strip()
-        except re.error as e:
-            logger.warning(f"[Conversa] 清理正则无效: {e}，跳过清理")
-            return text
-        if cleaned != text:
-            logger.debug("[Conversa] 已清理主动回复中的插件标记")
-        return cleaned
 
     async def _send_text(self, umo: str, text: str):
         """发送主动回复消息到指定会话"""
