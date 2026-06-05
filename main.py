@@ -51,6 +51,8 @@ try:
     from astrbot.core.provider.entities import ProviderRequest
     from astrbot.core.platform.message_session import MessageSession
     from astrbot.core.utils.history_saver import persist_agent_history
+    from astrbot.core.pipeline.context_utils import call_event_hook
+    from astrbot.core.star.star_handler import EventType
     HAS_AGENT_PIPELINE = True
 except ImportError:
     HAS_AGENT_PIPELINE = False
@@ -755,6 +757,8 @@ class Conversa(Star):
     async def _on_llm_response_enhancement(self, event: AstrMessageEvent, _response=None):
         """对话增强：LLM 回复后检查是否应触发短期追回复"""
         try:
+            if event.get_extra("conversa_proactive"):
+                return
             umo = event.unified_msg_origin
             if self._should_trigger_enhancement(umo):
                 self._schedule_enhancement(umo)
@@ -1639,13 +1643,30 @@ class Conversa(Star):
             context=self.context,
             session=session,
             message=prompt,
+            extras={"conversa_proactive": True},
         )
 
         # 构建 Agent 配置（与框架 cron 系统一致）
+        astr_conf = self.context.get_config(umo=umo)
+        provider_settings = astr_conf.get("provider_settings", {}) if astr_conf else {}
         config = MainAgentBuildConfig(
-            tool_call_timeout=120,
-            llm_safety_mode=False,
+            tool_call_timeout=provider_settings.get("tool_call_timeout", 120),
+            tool_schema_mode=provider_settings.get("tool_schema_mode", "full"),
             streaming_response=False,
+            sanitize_context_by_modalities=provider_settings.get("sanitize_context_by_modalities", False),
+            context_limit_reached_strategy=provider_settings.get("context_limit_reached_strategy", "truncate_by_turns"),
+            llm_compress_instruction=provider_settings.get("llm_compress_instruction", ""),
+            llm_compress_keep_recent=provider_settings.get("llm_compress_keep_recent", 4),
+            llm_compress_provider_id=provider_settings.get("llm_compress_provider_id", ""),
+            max_context_length=provider_settings.get("max_context_length", -1),
+            dequeue_context_length=provider_settings.get("dequeue_context_length", 1),
+            llm_safety_mode=False,
+            safety_mode_strategy=provider_settings.get("safety_mode_strategy", "system_prompt"),
+            computer_use_runtime=provider_settings.get("computer_use_runtime", "local"),
+            sandbox_cfg=provider_settings.get("sandbox", {}),
+            provider_settings=provider_settings,
+            timezone=astr_conf.get("timezone") if astr_conf else None,
+            max_quoted_fallback_images=provider_settings.get("max_quoted_fallback_images", 20),
         )
 
         # 固定 provider（如果配置了）
@@ -1668,11 +1689,21 @@ class Conversa(Star):
             config=config,
             provider=provider,
             req=req,
+            apply_reset=False,
         )
 
         if not result or not result.agent_runner:
             logger.warning(f"[Conversa] build_main_agent 返回空结果: {umo}")
             return None
+
+        if await call_event_hook(cron_event, EventType.OnLLMRequestEvent, result.provider_request):
+            if result.reset_coro:
+                result.reset_coro.close()
+            logger.debug(f"[Conversa] OnLLMRequestEvent 终止主动回复: {umo}")
+            return None
+
+        if result.reset_coro:
+            await result.reset_coro
 
         runner = result.agent_runner
         async for _ in runner.step_until_done(30):
