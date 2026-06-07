@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
+from astrbot.core.message.message_event_result import ResultContentType
 
 # 尝试导入 StarTools（如果可用）
 try:
@@ -281,7 +282,7 @@ class Reminder:
         )
 
 # 主插件类
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "3.0", 
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "3.0.1", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
@@ -1604,8 +1605,9 @@ class Conversa(Star):
             logger.info(f"[Conversa] 准备主动回复 {umo}")
 
             # --- 走官方 Agent Pipeline ---
+            send_event = None
             if HAS_AGENT_PIPELINE:
-                response_text = await self._run_agent_pipeline(umo, prompt, tz)
+                response_text, send_event = await self._run_agent_pipeline(umo, prompt, tz)
             else:
                 # 降级：旧版本框架不支持 CronMessageEvent
                 response_text = await self._run_legacy_llm(umo, prompt)
@@ -1615,7 +1617,7 @@ class Conversa(Star):
 
             # 发送消息（如果 Agent 没有通过工具自行发送）
             if not getattr(self, '_last_cron_event_sent', False):
-                await self._send_text(umo, response_text)
+                await self._send_text(umo, response_text, send_event)
             logger.info(f"[Conversa] 已发送主动回复给 {umo}: {response_text[:50]}...")
 
             # --- 更新状态 ---
@@ -1634,7 +1636,7 @@ class Conversa(Star):
             logger.error(f"[Conversa] proactive error({umo}): {e}", exc_info=True)
             return False
 
-    async def _run_agent_pipeline(self, umo: str, prompt: str, tz: Optional[str] = None) -> Optional[str]:
+    async def _run_agent_pipeline(self, umo: str, prompt: str, tz: Optional[str] = None) -> Tuple[Optional[str], Optional[AstrMessageEvent]]:
         """通过官方 CronMessageEvent + build_main_agent 执行 Agent Pipeline"""
         self._last_cron_event_sent = False
 
@@ -1649,25 +1651,31 @@ class Conversa(Star):
         # 构建 Agent 配置（与框架 cron 系统一致）
         astr_conf = self.context.get_config(umo=umo)
         provider_settings = astr_conf.get("provider_settings", {}) if astr_conf else {}
-        config = MainAgentBuildConfig(
-            tool_call_timeout=provider_settings.get("tool_call_timeout", 120),
-            tool_schema_mode=provider_settings.get("tool_schema_mode", "full"),
-            streaming_response=False,
-            sanitize_context_by_modalities=provider_settings.get("sanitize_context_by_modalities", False),
-            context_limit_reached_strategy=provider_settings.get("context_limit_reached_strategy", "truncate_by_turns"),
-            llm_compress_instruction=provider_settings.get("llm_compress_instruction", ""),
-            llm_compress_keep_recent=provider_settings.get("llm_compress_keep_recent", 4),
-            llm_compress_provider_id=provider_settings.get("llm_compress_provider_id", ""),
-            max_context_length=provider_settings.get("max_context_length", -1),
-            dequeue_context_length=provider_settings.get("dequeue_context_length", 1),
-            llm_safety_mode=False,
-            safety_mode_strategy=provider_settings.get("safety_mode_strategy", "system_prompt"),
-            computer_use_runtime=provider_settings.get("computer_use_runtime", "local"),
-            sandbox_cfg=provider_settings.get("sandbox", {}),
-            provider_settings=provider_settings,
-            timezone=astr_conf.get("timezone") if astr_conf else None,
-            max_quoted_fallback_images=provider_settings.get("max_quoted_fallback_images", 20),
-        )
+        config_fields = getattr(MainAgentBuildConfig, "__dataclass_fields__", {})
+        config_kwargs = {
+            "tool_call_timeout": provider_settings.get("tool_call_timeout", 120),
+            "tool_schema_mode": provider_settings.get("tool_schema_mode", "full"),
+            "streaming_response": False,
+            "sanitize_context_by_modalities": provider_settings.get("sanitize_context_by_modalities", False),
+            "context_limit_reached_strategy": provider_settings.get("context_limit_reached_strategy", "truncate_by_turns"),
+            "llm_compress_instruction": provider_settings.get("llm_compress_instruction", ""),
+            "llm_compress_provider_id": provider_settings.get("llm_compress_provider_id", ""),
+            "max_context_length": provider_settings.get("max_context_length", -1),
+            "dequeue_context_length": provider_settings.get("dequeue_context_length", 1),
+            "llm_safety_mode": False,
+            "safety_mode_strategy": provider_settings.get("safety_mode_strategy", "system_prompt"),
+            "computer_use_runtime": provider_settings.get("computer_use_runtime", "local"),
+            "sandbox_cfg": provider_settings.get("sandbox", {}),
+            "provider_settings": provider_settings,
+            "timezone": astr_conf.get("timezone") if astr_conf else None,
+            "max_quoted_fallback_images": provider_settings.get("max_quoted_fallback_images", 20),
+        }
+        if "llm_compress_keep_recent_ratio" in config_fields:
+            config_kwargs["llm_compress_keep_recent_ratio"] = provider_settings.get("llm_compress_keep_recent_ratio", 0.15)
+        elif "llm_compress_keep_recent" in config_fields:
+            config_kwargs["llm_compress_keep_recent"] = provider_settings.get("llm_compress_keep_recent", 4)
+
+        config = MainAgentBuildConfig(**{k: v for k, v in config_kwargs.items() if k in config_fields})
 
         # 固定 provider（如果配置了）
         fixed_provider_id = self._get_cfg("advanced", "fixed_provider", "") or ""
@@ -1694,13 +1702,13 @@ class Conversa(Star):
 
         if not result or not result.agent_runner:
             logger.warning(f"[Conversa] build_main_agent 返回空结果: {umo}")
-            return None
+            return None, cron_event
 
         if await call_event_hook(cron_event, EventType.OnLLMRequestEvent, result.provider_request):
             if result.reset_coro:
                 result.reset_coro.close()
             logger.debug(f"[Conversa] OnLLMRequestEvent 终止主动回复: {umo}")
-            return None
+            return None, cron_event
 
         if result.reset_coro:
             await result.reset_coro
@@ -1712,11 +1720,11 @@ class Conversa(Star):
         llm_resp = runner.get_final_llm_resp()
         if not llm_resp or not llm_resp.completion_text:
             logger.debug(f"[Conversa] Agent 无文本响应: {umo}")
-            return None
+            return None, cron_event
 
         response_text = llm_resp.completion_text.strip()
         if not response_text:
-            return None
+            return None, cron_event
 
         # 记录 Agent 是否已通过工具发送了消息
         self._last_cron_event_sent = getattr(cron_event, '_has_send_oper', False)
@@ -1733,7 +1741,7 @@ class Conversa(Star):
         except Exception as e:
             logger.warning(f"[Conversa] persist_agent_history 失败: {e}")
 
-        return response_text
+        return response_text, cron_event
 
     async def _run_legacy_llm(self, umo: str, prompt: str) -> Optional[str]:
         """降级方案：直接调用 provider.text_chat()（旧版本框架兼容）"""
@@ -1795,8 +1803,9 @@ class Conversa(Star):
             logger.info(f"[Conversa] 触发 AI 提醒 for {umo}: {reminder_content}")
 
             # 走官方 Agent Pipeline 或降级
+            send_event = None
             if HAS_AGENT_PIPELINE:
-                response_text = await self._run_agent_pipeline(umo, prompt, tz)
+                response_text, send_event = await self._run_agent_pipeline(umo, prompt, tz)
             else:
                 response_text = await self._run_legacy_llm(umo, prompt)
 
@@ -1805,7 +1814,7 @@ class Conversa(Star):
 
             # 发送消息（如果 Agent 没有通过工具自行发送）
             if not getattr(self, '_last_cron_event_sent', False):
-                await self._send_text(umo, response_text)
+                await self._send_text(umo, response_text, send_event)
             logger.info(f"[Conversa] 已发送 AI 提醒给 {umo}: {response_text[:50]}...")
 
             # 更新状态
@@ -1943,9 +1952,24 @@ class Conversa(Star):
             logger.warning(f"[Conversa] 分段处理失败，使用原始文本: {e}")
             return [text]
 
-    async def _send_text(self, umo: str, text: str):
+    async def _send_text(self, umo: str, text: str, send_event: Optional[AstrMessageEvent] = None):
         """发送主动回复消息到指定会话"""
         try:
+            if send_event:
+                result = send_event.plain_result(text)
+                result.set_result_content_type(ResultContentType.LLM_RESULT)
+                send_event.set_result(result)
+                setattr(send_event, "__is_llm_reply", True)
+
+                if await call_event_hook(send_event, EventType.OnDecoratingResultEvent):
+                    return
+
+                decorated_result = send_event.get_result()
+                if decorated_result and decorated_result.chain:
+                    await send_event.send(decorated_result)
+                send_event.clear_result()
+                return
+
             # 检查 umo 是否缺少 session_id（例如：platform:MessageType:None）
             # 如果是，尝试从 conversation_manager 获取完整的 umo
             if umo.endswith(":None") or ":None" in umo:

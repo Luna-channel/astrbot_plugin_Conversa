@@ -1,5 +1,17 @@
 # Conversa 更新日志
 
+## v3.0.1 (2026-06-07)
+
+### Bug 修复
+
+- 修复主动回复绕过 AstrBot 发送前装饰阶段的问题。主动回复现在会构造 `MessageEventResult` 并触发 `OnDecoratingResultEvent`，确保消息分段、后置清理正则等插件 hook 能正常处理。
+- 修复 AstrBot 新版移除 `llm_compress_keep_recent` 后，主动回复构造 `MainAgentBuildConfig` 抛出 `unexpected keyword argument` 的问题。新版框架使用 `llm_compress_keep_recent_ratio`，旧版框架继续使用 `llm_compress_keep_recent`。
+
+### 维护
+
+- 新增 `.gitignore`，忽略 `__pycache__` 与 Python 字节码文件。
+- 从 Git 索引中移除已跟踪的 `__pycache__/main.cpython-314.pyc`。
+
 ## v3.0.0 (2026-05-28)
 
 ---

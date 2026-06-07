@@ -1,12 +1,18 @@
 # Conversa · AI 主动续聊插件 for AstrBot
 
 > **作者**：柯尔 (Luna-channel)
-> **版本**：v3.0.0
+> **版本**：v3.0.1
 > **仓库**：<https://github.com/Luna-channel/astrbot_plugin_Conversa>
 
 Conversa 让 AI 像真人一样主动找你聊天 —— 在对话沉寂一段时间后自然地重新开口，或者在你们正聊着的时候概率性地追加一句话，营造更真实的对话体验。
 
 ---
+
+## v3.0.1 更新说明
+
+- 修复主动回复直接发送导致其他插件 `on_decorating_result` 后置处理无法生效的问题，主动回复现在会进入发送前 hook 链路。
+- 兼容 AstrBot 新版 `llm_compress_keep_recent_ratio` 参数，同时保留旧版 `llm_compress_keep_recent` 支持。
+- 新增 Python 缓存忽略规则，避免 `__pycache__` / `.pyc` 文件继续进入版本库。
 
 ## v3.0 更新亮点
 
