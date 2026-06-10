@@ -4,6 +4,7 @@
 
 ### Bug 修复
 
+- 修复主动回复进入 `OnDecoratingResultEvent` 后仍一次性发送整个 `MessageEventResult`，导致 AstrBot 分段回复配置未能按段落逐条发送的问题。
 - 修复主动回复绕过 AstrBot 发送前装饰阶段的问题。主动回复现在会构造 `MessageEventResult` 并触发 `OnDecoratingResultEvent`，确保消息分段、后置清理正则等插件 hook 能正常处理。
 - 修复 AstrBot 新版移除 `llm_compress_keep_recent` 后，主动回复构造 `MainAgentBuildConfig` 抛出 `unexpected keyword argument` 的问题。新版框架使用 `llm_compress_keep_recent_ratio`，旧版框架继续使用 `llm_compress_keep_recent`。
 
