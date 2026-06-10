@@ -1966,7 +1966,24 @@ class Conversa(Star):
 
                 decorated_result = send_event.get_result()
                 if decorated_result and decorated_result.chain:
-                    await send_event.send(decorated_result)
+                    if len(decorated_result.chain) > 1:
+                        for comp in decorated_result.chain:
+                            await send_event.send(decorated_result.derive([comp]))
+                            await asyncio.sleep(1.5)
+                    else:
+                        comp = decorated_result.chain[0]
+                        text_content = getattr(comp, "text", None)
+                        segments = (
+                            self._apply_segmentation(text_content)
+                            if isinstance(text_content, str)
+                            else []
+                        )
+                        if len(segments) > 1:
+                            for segment in segments:
+                                await send_event.send(send_event.plain_result(segment))
+                                await asyncio.sleep(1.5)
+                        else:
+                            await send_event.send(decorated_result)
                 send_event.clear_result()
                 return
 
