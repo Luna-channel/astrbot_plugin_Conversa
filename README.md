@@ -1,12 +1,18 @@
 # Conversa · AI 主动续聊插件 for AstrBot
 
 > **作者**：柯尔 (Luna-channel)
-> **版本**：v3.0.1
+> **版本**：v3.0.2
 > **仓库**：<https://github.com/Luna-channel/astrbot_plugin_Conversa>
 
 Conversa 让 AI 像真人一样主动找你聊天 —— 在对话沉寂一段时间后自然地重新开口，或者在你们正聊着的时候概率性地追加一句话，营造更真实的对话体验。
 
 ---
+
+## v3.0.2 更新说明
+
+- 修复 v3.0.1 主动回复只触发插件 hook、未进入 AstrBot 内置发送阶段的问题。
+- 主动回复现在会复用 `ResultDecorateStage` 与 `RespondStage`，恢复 AstrBot 自带正则分段、逐段发送、TTS / t2i、发送后 hook 等框架发送行为。
+- 修复主动回复发送阶段平台名被识别为 `cron` 的问题，执行发送阶段时会临时使用真实平台信息，避免平台特殊逻辑误判。
 
 ## v3.0.1 更新说明
 

@@ -51,8 +51,10 @@ try:
     from astrbot.core.astr_main_agent import build_main_agent, MainAgentBuildConfig
     from astrbot.core.provider.entities import ProviderRequest
     from astrbot.core.platform.message_session import MessageSession
-    from astrbot.core.utils.history_saver import persist_agent_history
     from astrbot.core.pipeline.context_utils import call_event_hook
+    from astrbot.core.pipeline.context import PipelineContext
+    from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
+    from astrbot.core.pipeline.respond.stage import RespondStage
     from astrbot.core.star.star_handler import EventType
     HAS_AGENT_PIPELINE = True
 except ImportError:
@@ -147,6 +149,13 @@ def _format_time_delta(seconds: float) -> str:
         return f"{hours}小时"
     else:
         return f"{minutes}分钟"
+
+
+def _strip_proactive_summary_prefix(text: str) -> str:
+    """Remove Conversa's history summary marker if the model echoes it."""
+    if not text:
+        return text
+    return re.sub(r"^\s*\[Conversa主动发起对话\]\s*", "", text).strip()
 
 # 数据类定义
 @dataclass
@@ -282,7 +291,7 @@ class Reminder:
         )
 
 # 主插件类
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "3.0.1", 
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "3.0.2", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
@@ -1606,8 +1615,9 @@ class Conversa(Star):
 
             # --- 走官方 Agent Pipeline ---
             send_event = None
+            history_conversation = None
             if HAS_AGENT_PIPELINE:
-                response_text, send_event = await self._run_agent_pipeline(umo, prompt, tz)
+                response_text, send_event, history_conversation = await self._run_agent_pipeline(umo, prompt, tz)
             else:
                 # 降级：旧版本框架不支持 CronMessageEvent
                 response_text = await self._run_legacy_llm(umo, prompt)
@@ -1616,8 +1626,14 @@ class Conversa(Star):
                 return False
 
             # 发送消息（如果 Agent 没有通过工具自行发送）
+            sent = getattr(self, '_last_cron_event_sent', False)
             if not getattr(self, '_last_cron_event_sent', False):
-                await self._send_text(umo, response_text, send_event)
+                sent = await self._send_text(umo, response_text, send_event)
+            if not sent:
+                logger.warning(f"[Conversa] 主动回复发送未确认成功，跳过历史保存: {umo}")
+                return False
+
+            await self._save_proactive_history(umo, response_text, history_conversation)
             logger.info(f"[Conversa] 已发送主动回复给 {umo}: {response_text[:50]}...")
 
             # --- 更新状态 ---
@@ -1636,7 +1652,7 @@ class Conversa(Star):
             logger.error(f"[Conversa] proactive error({umo}): {e}", exc_info=True)
             return False
 
-    async def _run_agent_pipeline(self, umo: str, prompt: str, tz: Optional[str] = None) -> Tuple[Optional[str], Optional[AstrMessageEvent]]:
+    async def _run_agent_pipeline(self, umo: str, prompt: str, tz: Optional[str] = None) -> Tuple[Optional[str], Optional[AstrMessageEvent], object]:
         """通过官方 CronMessageEvent + build_main_agent 执行 Agent Pipeline"""
         self._last_cron_event_sent = False
 
@@ -1702,13 +1718,13 @@ class Conversa(Star):
 
         if not result or not result.agent_runner:
             logger.warning(f"[Conversa] build_main_agent 返回空结果: {umo}")
-            return None, cron_event
+            return None, cron_event, None
 
         if await call_event_hook(cron_event, EventType.OnLLMRequestEvent, result.provider_request):
             if result.reset_coro:
                 result.reset_coro.close()
             logger.debug(f"[Conversa] OnLLMRequestEvent 终止主动回复: {umo}")
-            return None, cron_event
+            return None, cron_event, None
 
         if result.reset_coro:
             await result.reset_coro
@@ -1720,28 +1736,16 @@ class Conversa(Star):
         llm_resp = runner.get_final_llm_resp()
         if not llm_resp or not llm_resp.completion_text:
             logger.debug(f"[Conversa] Agent 无文本响应: {umo}")
-            return None, cron_event
+            return None, cron_event, None
 
-        response_text = llm_resp.completion_text.strip()
+        response_text = _strip_proactive_summary_prefix(llm_resp.completion_text.strip())
         if not response_text:
-            return None, cron_event
+            return None, cron_event, None
 
         # 记录 Agent 是否已通过工具发送了消息
         self._last_cron_event_sent = getattr(cron_event, '_has_send_oper', False)
 
-        # 保存对话历史（与框架 cron 系统一致）
-        try:
-            summary = f"[Conversa主动发起对话] {response_text[:100]}"
-            await persist_agent_history(
-                self.context.conversation_manager,
-                event=cron_event,
-                req=result.provider_request,
-                summary_note=summary,
-            )
-        except Exception as e:
-            logger.warning(f"[Conversa] persist_agent_history 失败: {e}")
-
-        return response_text, cron_event
+        return response_text, cron_event, result.provider_request.conversation
 
     async def _run_legacy_llm(self, umo: str, prompt: str) -> Optional[str]:
         """降级方案：直接调用 provider.text_chat()（旧版本框架兼容）"""
@@ -1763,7 +1767,7 @@ class Conversa(Star):
             system_prompt=""
         )
         text = llm_resp.completion_text if hasattr(llm_resp, "completion_text") else ""
-        return text.strip() if text else None
+        return _strip_proactive_summary_prefix(text.strip()) if text else None
     
     async def _proactive_reminder_reply(self, umo: str, reminder_content: str) -> bool:
         """
@@ -1804,8 +1808,9 @@ class Conversa(Star):
 
             # 走官方 Agent Pipeline 或降级
             send_event = None
+            history_conversation = None
             if HAS_AGENT_PIPELINE:
-                response_text, send_event = await self._run_agent_pipeline(umo, prompt, tz)
+                response_text, send_event, history_conversation = await self._run_agent_pipeline(umo, prompt, tz)
             else:
                 response_text = await self._run_legacy_llm(umo, prompt)
 
@@ -1813,8 +1818,14 @@ class Conversa(Star):
                 return False
 
             # 发送消息（如果 Agent 没有通过工具自行发送）
+            sent = getattr(self, '_last_cron_event_sent', False)
             if not getattr(self, '_last_cron_event_sent', False):
-                await self._send_text(umo, response_text, send_event)
+                sent = await self._send_text(umo, response_text, send_event)
+            if not sent:
+                logger.warning(f"[Conversa] AI 提醒发送未确认成功，跳过历史保存: {umo}")
+                return False
+
+            await self._save_proactive_history(umo, response_text, history_conversation)
             logger.info(f"[Conversa] 已发送 AI 提醒给 {umo}: {response_text[:50]}...")
 
             # 更新状态
@@ -1831,12 +1842,34 @@ class Conversa(Star):
             logger.error(f"[Conversa] proactive reminder error({umo}): {e}", exc_info=True)
             return False
 
+    async def _save_proactive_history(self, umo: str, response_text: str, conversation=None):
+        """Save proactive reply history after the reply is confirmed sent."""
+        try:
+            if conversation is None:
+                conv_mgr = self.context.conversation_manager
+                curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+                if not curr_cid:
+                    logger.warning(f"[Conversa] 当前会话为空，无法保存主动回复历史: {umo}")
+                    return
+                conversation = await conv_mgr.get_conversation(umo, curr_cid)
+            if not conversation:
+                logger.warning(f"[Conversa] 会话不存在，无法保存主动回复历史: {umo}")
+                return
+            await self._add_message_pair_to_history(
+                umo,
+                conversation.cid,
+                conversation,
+                "[Conversa主动发起对话]",
+                response_text,
+            )
+        except Exception as e:
+            logger.warning(f"[Conversa] 保存主动回复历史失败: {e}")
+
     async def _add_message_pair_to_history(self, umo: str, conversation_id: str, conversation, user_prompt: str, assistant_response: str):
         """
         将消息对添加到对话历史（使用官方 API）
         
-        注意：走 build_main_agent + persist_agent_history 的主动回复已经自动保存历史，
-        此方法仅用于降级路径或其他需要手动追加历史的场景。
+        注意：主动回复会在确认发送成功后调用此方法，避免发送失败时提前污染历史。
         """
         try:
             if not conversation_id:
@@ -1952,7 +1985,7 @@ class Conversa(Star):
             logger.warning(f"[Conversa] 分段处理失败，使用原始文本: {e}")
             return [text]
 
-    async def _send_text(self, umo: str, text: str, send_event: Optional[AstrMessageEvent] = None):
+    async def _send_text(self, umo: str, text: str, send_event: Optional[AstrMessageEvent] = None) -> bool:
         """发送主动回复消息到指定会话"""
         try:
             if send_event:
@@ -1961,14 +1994,7 @@ class Conversa(Star):
                 send_event.set_result(result)
                 setattr(send_event, "__is_llm_reply", True)
 
-                if await call_event_hook(send_event, EventType.OnDecoratingResultEvent):
-                    return
-
-                decorated_result = send_event.get_result()
-                if decorated_result and decorated_result.chain:
-                    await send_event.send(decorated_result)
-                send_event.clear_result()
-                return
+                return await self._run_send_stages(send_event)
 
             # 检查 umo 是否缺少 session_id（例如：platform:MessageType:None）
             # 如果是，尝试从 conversation_manager 获取完整的 umo
@@ -2000,9 +2026,62 @@ class Conversa(Star):
                 # 如果有多个分段，添加短暂延迟（模拟分段回复的间隔）
                 if len(segments) > 1:
                     await asyncio.sleep(1.5)
-            
+            return True
+             
         except Exception as e:
             logger.error(f"[Conversa] ❌ 发送消息失败({umo}): {e}")
+            return False
+
+    async def _run_send_stages(self, event: AstrMessageEvent) -> bool:
+        """Run AstrBot's result decoration and respond stages for proactive events."""
+        plugin_manager = getattr(self.context, "_star_manager", None)
+        if not plugin_manager:
+            result = event.get_result()
+            if result and result.chain:
+                await event.send(result)
+                event.clear_result()
+                return True
+            event.clear_result()
+            return False
+
+        pipe_ctx = PipelineContext(
+            self.context.get_config(umo=event.unified_msg_origin),
+            plugin_manager,
+            event.get_platform_id(),
+        )
+
+        old_platform_meta = event.platform_meta
+        platform = self.context.get_platform_inst(event.get_platform_id())
+        if platform:
+            event.platform_meta = platform.meta()
+
+        send_count = 0
+        original_send = event.send
+
+        async def tracked_send(*args, **kwargs):
+            nonlocal send_count
+            result = await original_send(*args, **kwargs)
+            send_count += 1
+            return result
+
+        event.send = tracked_send
+
+        try:
+            for stage_cls in (ResultDecorateStage, RespondStage):
+                stage = stage_cls()
+                await stage.initialize(pipe_ctx)
+                processed = stage.process(event)
+                if hasattr(processed, "__aiter__"):
+                    async for _ in processed:
+                        pass
+                else:
+                    await processed
+                if event.is_stopped():
+                    break
+            return send_count > 0
+        finally:
+            event.send = original_send
+            event.platform_meta = old_platform_meta
     
     async def _send_reminder_message(self, umo: str, text: str):
         """发送提醒消息到指定会话"""

@@ -1,5 +1,13 @@
 # Conversa 更新日志
 
+## v3.0.2 (2026-06-07)
+
+### Bug 修复
+
+- 修复 v3.0.1 主动回复只触发 `OnDecoratingResultEvent` 插件 hook，但未执行 AstrBot 自带 `ResultDecorateStage` 内置正则分段的问题。
+- 主动回复发送改为复用 `ResultDecorateStage` 与 `RespondStage`，确保 AstrBot 自带正则分段、逐段发送、TTS / t2i、发送后 hook 等框架发送逻辑正常生效。
+- 修复主动回复发送阶段 `event.get_platform_name()` 被识别为 `cron` 的问题。执行发送阶段时临时切换为真实平台信息，避免平台排除、超长转发等平台特殊逻辑误判。
+
 ## v3.0.1 (2026-06-07)
 
 ### Bug 修复
