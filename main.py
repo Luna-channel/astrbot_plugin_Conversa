@@ -203,6 +203,7 @@ class SessionState:
     next_idle_ts: float = 0.0
     enhancement_chain_count: int = 0  # 连续插件主动回复计数（用于指数递减）
     last_proactive_reply_ts: float = 0.0  # 最近一次主动回复时间戳
+    emotion_gate_skip_until: float = 0.0  # 情感门控否决后的跳过截止时间戳
     
     def __post_init__(self):
         """初始化后处理"""
@@ -221,7 +222,8 @@ class SessionState:
             "consecutive_no_reply_count": self.consecutive_no_reply_count,
             "next_idle_ts": self.next_idle_ts,
             "enhancement_chain_count": self.enhancement_chain_count,
-            "last_proactive_reply_ts": self.last_proactive_reply_ts
+            "last_proactive_reply_ts": self.last_proactive_reply_ts,
+            "emotion_gate_skip_until": self.emotion_gate_skip_until
         }
 
     @classmethod
@@ -238,7 +240,8 @@ class SessionState:
             consecutive_no_reply_count=data.get("consecutive_no_reply_count", 0),
             next_idle_ts=data.get("next_idle_ts", 0.0),
             enhancement_chain_count=data.get("enhancement_chain_count", 0),
-            last_proactive_reply_ts=data.get("last_proactive_reply_ts", 0.0)
+            last_proactive_reply_ts=data.get("last_proactive_reply_ts", 0.0),
+            emotion_gate_skip_until=data.get("emotion_gate_skip_until", 0.0)
         )
     
     def has_fired(self, tag: str) -> bool:
@@ -1295,6 +1298,7 @@ class Conversa(Star):
                 await asyncio.sleep(30)
                 if self._stopped:
                     break
+                logger.debug("[Conversa] TICK: running scheduler loop iteration")
                 await self._tick()
         except asyncio.CancelledError:
             pass  # 正常取消，不需要日志
@@ -1317,9 +1321,11 @@ class Conversa(Star):
         """
         # 检查插件是否已停止（框架禁用插件时会调用terminate设置此标志）
         if self._stopped:
+            logger.debug("[Conversa] TICK: skipped, plugin stopped")
             return
         
         if not self.cfg.get("enable", True):
+            logger.debug("[Conversa] TICK: skipped, plugin disabled in config")
             return
         
         # 从配置同步订阅状态（实现配置热重载，静默模式，只在有变化时打印日志）
@@ -1408,9 +1414,11 @@ class Conversa(Star):
                                    hist_n: int, tz: Optional[str], reply_interval: int):
         """检查并触发延时问候"""
         if not bool(self._get_cfg("idle_greetings", "enable_idle_greetings", True)):
+            logger.debug(f"[Conversa] IDLE_CHECK({umo}): 功能已禁用")
             return
         
         if not st:
+            logger.debug(f"[Conversa] IDLE_CHECK({umo}): st=None")
             return
         
         # 向后兼容：如果 next_idle_ts 未设置或为0，自动初始化
@@ -1427,17 +1435,25 @@ class Conversa(Star):
                 # 基于最后活跃时间计算
                 base_ts = st.last_ts if st.last_ts > 0 else now.timestamp()
                 st.next_idle_ts = base_ts + delay_m * 60
-                logger.debug(f"[Conversa] 向后兼容：为 {umo} 初始化 next_idle_ts = {st.next_idle_ts}")
+                logger.debug(f"[Conversa] IDLE_CHECK({umo}): 初始化 next_idle_ts = last_ts + {delay_m}m = {st.next_idle_ts}")
                 await self._debounced_save_session_data()
                 return  # 本次不触发，等下次检查
         
         if now.timestamp() < st.next_idle_ts:
+            logger.debug(f"[Conversa] IDLE_CHECK({umo}): 时间未到 (还需 {st.next_idle_ts - now.timestamp():.0f}s)")
             return
         
         tag = f"idle@{now.strftime('%Y-%m-%d %H:%M')}"
         if st.has_fired(tag):
+            logger.debug(f"[Conversa] IDLE_CHECK({umo}): 已触发过 {tag}")
             return
-        
+
+        # === 情感门控：让 LLM 判断角色此刻是否愿意主动搭话 ===
+        logger.debug(f"[Conversa] IDLE_CHECK({umo}): 进入情感门控")
+        if not await self._emotion_gate_check(umo, st, now, tz, trigger_type="idle"):
+            logger.debug(f"[Conversa] IDLE_CHECK({umo}): 情感门控返回 NO")
+            return
+
         idle_prompts = self._get_cfg("idle_greetings", "idle_prompt_templates") or []
         if not idle_prompts:
             return
@@ -1941,6 +1957,156 @@ class Conversa(Star):
         except Exception as e:
             logger.debug(f"[Conversa] 获取最近消息失败: {e}")
         return last_user, last_ai
+
+    async def _get_recent_context_for_gate(self, umo: str, depth: int) -> str:
+        """获取最近 N 条对话摘要，供情感门控判断使用"""
+        try:
+            conv_mgr = self.context.conversation_manager
+            curr_cid = await conv_mgr.get_curr_conversation_id(umo)
+            if not curr_cid:
+                return "（无历史对话）"
+
+            conversation = await conv_mgr.get_conversation(umo, curr_cid)
+            if not conversation or not conversation.history:
+                return "（无历史对话）"
+
+            history = json.loads(conversation.history) if isinstance(conversation.history, str) else conversation.history
+            if not isinstance(history, list):
+                return "（无历史对话）"
+
+            recent = []
+            for msg in reversed(history[-depth:]):
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        p.get("text", "") for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    )
+                content = str(content)[:300]  # 每条截断 300 字
+                if role == "user":
+                    recent.insert(0, f"[用户]: {content}")
+                elif role == "assistant":
+                    recent.insert(0, f"[自己]: {content}")
+
+            return "\n".join(recent) if recent else "（无历史对话）"
+        except Exception as e:
+            logger.debug(f"[Conversa] 获取门控上下文失败: {e}")
+            return "（获取失败）"
+
+    async def _emotion_gate_check(self, umo: str, st: SessionState, now: datetime,
+                                   tz: Optional[str], trigger_type: str = "idle") -> bool:
+        """
+        情感门控：让 LLM 判断角色此刻是否愿意主动搭话。
+        
+        Returns:
+            True  = 可以发起主动回复
+            False = 应跳过（角色不想说话 / 刚吵完架 / 连续贴太多次等）
+        """
+        # 获取门控配置
+        gate_cfg = self.cfg.get("emotion_gate") or {}
+        if not gate_cfg.get("enable_emotion_gate", False):
+            return True  # 门控未启用，放行
+
+        # ---- 硬规则：检查 skip_until ----
+        if st.emotion_gate_skip_until > 0 and now.timestamp() < st.emotion_gate_skip_until:
+            remaining = int(st.emotion_gate_skip_until - now.timestamp())
+            logger.debug(f"[EmotionGate] ⏸️ skip_until 冷却中，剩余 {remaining // 60}分{remaining % 60}秒 → 跳过 {umo} [{trigger_type}]")
+            return False
+
+        # ---- 硬规则：连续主动上限 ----
+        max_chain = int(gate_cfg.get("emotion_gate_max_consecutive_proactive", 0))
+        if max_chain > 0 and st.enhancement_chain_count >= max_chain:
+            logger.info(f"[EmotionGate] 连续主动 {st.enhancement_chain_count} 次 >= {max_chain}，强制跳过 {umo}")
+            # 强制否决，也设置后延
+            skip_m = int(gate_cfg.get("emotion_gate_skip_delay_minutes", 60))
+            st.emotion_gate_skip_until = now.timestamp() + skip_m * 60
+            return False
+
+        # ---- 准备门控 prompt ----
+        depth = int(gate_cfg.get("emotion_gate_context_depth", 8))
+        context = await self._get_recent_context_for_gate(umo, depth)
+
+        time_fmt = self._get_cfg("basic_settings", "time_format") or "%Y-%m-%d %H:%M"
+        now_str = now.strftime(time_fmt)
+
+        time_since_last_chat = "未知"
+        if st.last_user_reply_ts > 0:
+            delta = now.timestamp() - st.last_user_reply_ts
+            time_since_last_chat = _format_time_delta(delta)
+
+        # 角色状态（自动从运行时数据生成，无需手动填写）
+        if gate_cfg.get("emotion_gate_include_character_state", True):
+            weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+            weekday = weekday_names[now.weekday()]
+            character_state = (
+                f"当前时间：{now_str}（{weekday}）\n"
+                f"距上次对话：{time_since_last_chat}\n"
+                f"已连续主动搭话 {st.enhancement_chain_count} 次但对方未回复"
+            )
+            # 附加上一次对话的时间段特征
+            if st.last_user_reply_ts > 0:
+                last_hour = datetime.fromtimestamp(st.last_user_reply_ts, tz=now.tzinfo).hour
+                if 0 <= last_hour < 6:
+                    character_state += "\n上次聊天在深夜，可能话题比较私密或情绪化"
+                elif 22 <= last_hour:
+                    character_state += "\n上次聊天在晚间，之后是休息时间"
+        else:
+            character_state = ""
+
+        template = gate_cfg.get("emotion_gate_prompt_template", "") or "请判断是否应发起主动对话。只回答 YES 或 NO。"
+        try:
+            prompt = template.format(
+                persona_summary=gate_cfg.get("emotion_gate_persona_summary", "") or "（未设定）",
+                character_state=character_state,
+                context=context,
+                time_since_last_chat=time_since_last_chat,
+                now=now_str,
+                chain_count=st.enhancement_chain_count
+            )
+        except KeyError as e:
+            logger.warning(f"[EmotionGate] prompt 模板格式化失败: {e}")
+            return True  # 模板错误时放行，避免阻断正常流程
+
+        logger.debug(f"[EmotionGate] 发送门控判断 prompt (长度{len(prompt)}字)\n{prompt}")
+        try:
+            # 获取 provider：优先门控专用 > fixed_provider > 当前会话
+            gate_provider_id = gate_cfg.get("emotion_gate_provider", "") or ""
+            fixed_id = self._get_cfg("advanced", "fixed_provider", "") or ""
+            provider = None
+            if gate_provider_id:
+                provider = self.context.get_provider_by_id(gate_provider_id)
+            if not provider and fixed_id:
+                provider = self.context.get_provider_by_id(fixed_id)
+            if not provider:
+                provider = self.context.get_using_provider(umo=umo)
+            if not provider:
+                logger.warning("[EmotionGate] 无可用 provider，放行")
+                return True
+
+            llm_resp = await provider.text_chat(
+                prompt=prompt,
+                contexts=[],
+                system_prompt="你是一个角色人格判断器。你的任务是判断角色此刻是否愿意主动搭话。只回答 YES 或 NO，然后附一句话理由。"
+            )
+            text = (llm_resp.completion_text if hasattr(llm_resp, "completion_text") else "").strip().upper()
+            logger.info(f"[EmotionGate] LLM 原始回复 [{trigger_type}]: >>>{text}<<<")
+
+            if text.startswith("YES"):
+                logger.info(f"[EmotionGate] ✅ YES → 放行 {umo} [{trigger_type}]")
+                return True
+            else:
+                reason = text[:200] if text else "无理由"
+                logger.info(f"[EmotionGate] ❌ NO → 跳过 {umo} [{trigger_type}] | 全文: {reason}")
+                skip_m = int(gate_cfg.get("emotion_gate_skip_delay_minutes", 60))
+                st.emotion_gate_skip_until = now.timestamp() + skip_m * 60
+                return False
+
+        except Exception as e:
+            logger.warning(f"[EmotionGate] LLM 调用失败，放行: {e}")
+            return True  # 异常时放行，避免阻断正常流程
 
     def _apply_segmentation(self, text: str) -> list[str]:
         """应用分段回复逻辑（模拟 AstrBot 的分段正则处理）

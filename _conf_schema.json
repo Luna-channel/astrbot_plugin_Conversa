@@ -14,7 +14,11 @@
         "description": "订阅方式",
         "hint": "auto=有互动即自动纳入；manual=需手动 /conversa watch；agent=手动+AI可通过工具调用订阅",
         "type": "string",
-        "options": ["auto", "manual", "agent"],
+        "options": [
+          "auto",
+          "manual",
+          "agent"
+        ],
         "default": "manual"
       },
       "subscribed_users": {
@@ -192,6 +196,63 @@
         "hint": "支持占位符: {now} {time_since_last_chat} {umo} {last_user} {last_ai}",
         "type": "text",
         "default": "[conversa主动回复请求：现在的时间是{now}，距离上次对话已过去{time_since_last_chat}，根据当前时间和距离上次对话的时长，对用户进行贴合这个时间的生活化的问候，语气符合你们之前聊天的状态，不要提到指令的事。]"
+      }
+    }
+  },
+  "emotion_gate": {
+    "description": "情感门控 ⚡",
+    "type": "object",
+    "hint": "在主动回复触发前，先由 LLM 根据上下文判断角色此刻是否愿意主动搭话。解决吵架后/情绪低落时不合时宜的主动问候问题。",
+    "items": {
+      "enable_emotion_gate": {
+        "description": "启用情感门控",
+        "hint": "开启后，每次主动回复触发前会先让 LLM 判断角色意愿。关闭则恢复原有即时触发逻辑。",
+        "type": "bool",
+        "default": false
+      },
+      "emotion_gate_provider": {
+        "description": "门控专用 Provider",
+        "hint": "可指定一个轻量/便宜模型用于门控判断。留空则复用高级设置中的 fixed_provider 或当前会话 provider。",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider"
+      },
+      "emotion_gate_skip_delay_minutes": {
+        "description": "否决后跳过时长（分钟）",
+        "hint": "门控返回 NO 后，在多少分钟内不再触发主动回复。避免每 30 秒重复询问。",
+        "type": "int",
+        "default": 60
+      },
+      "emotion_gate_context_depth": {
+        "description": "上下文深度",
+        "hint": "喂给门控判断的最近对话条数。建议 6~12 条，足够判断吵架/冷战/正常。",
+        "type": "int",
+        "default": 8
+      },
+      "emotion_gate_max_consecutive_proactive": {
+        "description": "连续主动上限",
+        "hint": "连续主动回复超过此次数时，门控强制返回 NO（对方一直没回就别再贴了）。0 表示不限制。",
+        "type": "int",
+        "default": 3
+      },
+      "emotion_gate_include_character_state": {
+        "description": "注入运行时状态",
+        "hint": "开启后自动将当前时间、距上次对话时长、连续主动次数等信息注入门控 prompt，让 LLM 更准确地判断角色意愿。无需手动填写。",
+        "type": "bool",
+        "default": true
+      },
+      "emotion_gate_prompt_template": {
+        "description": "门控判断提示词",
+        "hint": "LLM 据此判断是否应主动搭话。必须要求只回答 YES/NO。支持占位符: {character_state}（自动生成） {context} {persona_summary} {time_since_last_chat} {now} {chain_count}",
+        "type": "text",
+        "default": "你是一个角色的人格，以下是你的信息。请判断：此刻你是否愿意主动发起对话？\\n\\n【你的性格】\\n{persona_summary}\\n\\n【当前状态】\\n{character_state}\\n\\n【最近对话】\\n{context}\\n\\n基于以上信息，请只回答 YES 或 NO，然后用一句话（不超过20字）说明理由。\\n示例：YES（刚才聊到一半被打断了）\\n示例：NO（刚吵完架，需要冷静）"
+      },
+      "emotion_gate_persona_summary": {
+        "type": "text",
+        "default": "",
+        "description": "角色人格摘要",
+        "hint": "可选。2-3句话概括角色核心性格（如：冷淡、护短、讨厌被打扰）。注入门控 prompt 让 LLM 根据角色性格判断意愿。留空则不注入人格信息。",
+        "placeholder": "例：一个话少冷淡的角色，对陌生人保持距离，但对在乎的人会默默关心。"
       }
     }
   },
