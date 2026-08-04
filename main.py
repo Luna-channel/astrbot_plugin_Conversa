@@ -315,9 +315,9 @@ class Conversa(Star):
         # 对话增强相关
         self._enhancement_tasks: Dict[str, asyncio.Task] = {}
 
-        # 主动消息离线保护（全窗口共享，仅影响 Conversa 自身的主动触发）
-        self._offline_protection_fail_count = 0
-        self._offline_protection_blocked = False
+        # 主动消息离线保护（按平台共享，仅影响 Conversa 自身的主动触发）
+        self._offline_protection_fail_counts: Dict[str, int] = {}
+        self._offline_protection_blocked_platforms: set[str] = set()
         self._offline_protection_threshold = 3
         
         # 数据文件路径（使用规范的方式获取插件数据目录）
@@ -500,10 +500,17 @@ class Conversa(Star):
     def _offline_protection_enabled(self) -> bool:
         return bool(self._get_cfg("basic_settings", "offline_protection", True))
 
+    def _offline_protection_platform_key(self, umo: str) -> str:
+        try:
+            return umo.split(":", 1)[0] or "unknown"
+        except Exception:
+            return "unknown"
+
     def _should_skip_for_offline_protection(self, umo: str) -> bool:
         if not self._offline_protection_enabled():
             return False
-        if self._offline_protection_blocked:
+        platform_key = self._offline_protection_platform_key(umo)
+        if platform_key in self._offline_protection_blocked_platforms:
             logger.warning(f"[Conversa] 主动消息离线保护生效，跳过主动回复请求: {umo}")
             return True
         return False
@@ -511,25 +518,29 @@ class Conversa(Star):
     def _mark_proactive_send_success(self, umo: str):
         if not self._offline_protection_enabled():
             return
-        if self._offline_protection_blocked or self._offline_protection_fail_count > 0:
-            logger.info(f"[Conversa] 检测到消息通道恢复，已解除主动消息离线保护: {umo}")
-        self._offline_protection_fail_count = 0
-        self._offline_protection_blocked = False
+        platform_key = self._offline_protection_platform_key(umo)
+        fail_count = self._offline_protection_fail_counts.get(platform_key, 0)
+        if platform_key in self._offline_protection_blocked_platforms or fail_count > 0:
+            logger.info(f"[Conversa] 检测到消息通道恢复，已解除主动消息离线保护: {platform_key}")
+        self._offline_protection_fail_counts[platform_key] = 0
+        self._offline_protection_blocked_platforms.discard(platform_key)
 
     def _mark_proactive_send_failure(self, umo: str, error: Exception | None = None):
         if not self._offline_protection_enabled():
             return
-        self._offline_protection_fail_count += 1
+        platform_key = self._offline_protection_platform_key(umo)
+        fail_count = self._offline_protection_fail_counts.get(platform_key, 0) + 1
+        self._offline_protection_fail_counts[platform_key] = fail_count
         logger.warning(
             f"[Conversa] 主动消息发送失败，离线保护计数 "
-            f"{self._offline_protection_fail_count}/{self._offline_protection_threshold}: {umo}"
+            f"{fail_count}/{self._offline_protection_threshold}: {platform_key} ({umo})"
             + (f" ({error})" if error else "")
         )
-        if self._offline_protection_fail_count >= self._offline_protection_threshold and not self._offline_protection_blocked:
-            self._offline_protection_blocked = True
+        if fail_count >= self._offline_protection_threshold and platform_key not in self._offline_protection_blocked_platforms:
+            self._offline_protection_blocked_platforms.add(platform_key)
             logger.warning(
-                "[Conversa] 主动消息连续发送失败 3 次，已进入离线保护状态，"
-                "后续主动消息将暂停以节约 API 资源"
+                f"[Conversa] 平台 {platform_key} 主动消息连续发送失败 3 次，"
+                "已进入离线保护状态，后续该平台主动消息将暂停以节约 API 资源"
             )
 
     # 数据持久化
@@ -1363,10 +1374,6 @@ class Conversa(Star):
         if not self.cfg.get("enable", True):
             return
 
-        if self._offline_protection_enabled() and self._offline_protection_blocked:
-            logger.debug("[Conversa] 主动消息离线保护生效，本轮调度跳过")
-            return
-        
         # 从配置同步订阅状态（实现配置热重载，静默模式，只在有变化时打印日志）
         self._sync_subscribed_users_from_config(silent=True)
 

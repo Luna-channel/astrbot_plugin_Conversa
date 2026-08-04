@@ -46,7 +46,7 @@
       },
       "offline_protection": {
         "description": "主动消息离线保护",
-        "hint": "识别到长时间掉线之后自动停止触发主动消息以节约API资源",
+        "hint": "识别到长时间掉线之后自动停止触发对应平台的主动消息以节约API资源",
         "type": "bool",
         "default": true
       },
