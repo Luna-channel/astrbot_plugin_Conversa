@@ -291,7 +291,7 @@ class Reminder:
         )
 
 # 主插件类
-@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "3.0.2", 
+@register("Conversa", "柯尔", "Conversa能够让AI在会话沉寂一段时间后，像真人一样重新发起聊天，或者在每日的特定时间点送上问候，或以自然的方式进行定时提醒。", "3.1.0", 
           "https://github.com/Luna-channel/astrbot_plugin_Conversa")
 class Conversa(Star):
 
@@ -314,6 +314,11 @@ class Conversa(Star):
         
         # 对话增强相关
         self._enhancement_tasks: Dict[str, asyncio.Task] = {}
+
+        # 主动消息离线保护（全窗口共享，仅影响 Conversa 自身的主动触发）
+        self._offline_protection_fail_count = 0
+        self._offline_protection_blocked = False
+        self._offline_protection_threshold = 3
         
         # 数据文件路径（使用规范的方式获取插件数据目录）
         if HAS_STARTOOLS:
@@ -491,6 +496,41 @@ class Conversa(Star):
         if not isinstance(group, dict):
             return default
         return group.get(sub_key, default)
+
+    def _offline_protection_enabled(self) -> bool:
+        return bool(self._get_cfg("basic_settings", "offline_protection", True))
+
+    def _should_skip_for_offline_protection(self, umo: str) -> bool:
+        if not self._offline_protection_enabled():
+            return False
+        if self._offline_protection_blocked:
+            logger.warning(f"[Conversa] 主动消息离线保护生效，跳过主动回复请求: {umo}")
+            return True
+        return False
+
+    def _mark_proactive_send_success(self, umo: str):
+        if not self._offline_protection_enabled():
+            return
+        if self._offline_protection_blocked or self._offline_protection_fail_count > 0:
+            logger.info(f"[Conversa] 检测到消息通道恢复，已解除主动消息离线保护: {umo}")
+        self._offline_protection_fail_count = 0
+        self._offline_protection_blocked = False
+
+    def _mark_proactive_send_failure(self, umo: str, error: Exception | None = None):
+        if not self._offline_protection_enabled():
+            return
+        self._offline_protection_fail_count += 1
+        logger.warning(
+            f"[Conversa] 主动消息发送失败，离线保护计数 "
+            f"{self._offline_protection_fail_count}/{self._offline_protection_threshold}: {umo}"
+            + (f" ({error})" if error else "")
+        )
+        if self._offline_protection_fail_count >= self._offline_protection_threshold and not self._offline_protection_blocked:
+            self._offline_protection_blocked = True
+            logger.warning(
+                "[Conversa] 主动消息连续发送失败 3 次，已进入离线保护状态，"
+                "后续主动消息将暂停以节约 API 资源"
+            )
 
     # 数据持久化
     def _load_user_data(self):
@@ -708,6 +748,7 @@ class Conversa(Star):
 
         # 只有真实消息才取消待执行的对话增强任务
         if is_real_message:
+            self._mark_proactive_send_success(umo)
             old_task = self._enhancement_tasks.pop(umo, None)
             if old_task and not old_task.done():
                 old_task.cancel()
@@ -1321,6 +1362,10 @@ class Conversa(Star):
         
         if not self.cfg.get("enable", True):
             return
+
+        if self._offline_protection_enabled() and self._offline_protection_blocked:
+            logger.debug("[Conversa] 主动消息离线保护生效，本轮调度跳过")
+            return
         
         # 从配置同步订阅状态（实现配置热重载，静默模式，只在有变化时打印日志）
         self._sync_subscribed_users_from_config(silent=True)
@@ -1583,6 +1628,9 @@ class Conversa(Star):
         当框架 API 不可用时降级到旧的 provider.text_chat 方式。
         """
         try:
+            if self._should_skip_for_offline_protection(umo):
+                return False
+
             # --- 格式化 prompt（保留原有的占位符替换逻辑） ---
             now = _now_tz(tz)
             time_fmt = self._get_cfg("basic_settings", "time_format") or "%Y-%m-%d %H:%M"
@@ -1663,6 +1711,19 @@ class Conversa(Star):
             message=prompt,
             extras={"conversa_proactive": True},
         )
+        original_cron_send = cron_event.send
+
+        async def tracked_cron_send(*args, **kwargs):
+            try:
+                result = await original_cron_send(*args, **kwargs)
+            except Exception as e:
+                self._mark_proactive_send_failure(umo, e)
+                raise
+            self._mark_proactive_send_success(umo)
+            return result
+
+        cron_event.send = tracked_cron_send
+        setattr(cron_event, "_conversa_send_tracked", True)
 
         # 构建 Agent 配置（与框架 cron 系统一致）
         astr_conf = self.context.get_config(umo=umo)
@@ -1776,6 +1837,9 @@ class Conversa(Star):
         v3 改造：复用 _run_agent_pipeline / _run_legacy_llm，走合规调用。
         """
         try:
+            if self._should_skip_for_offline_protection(umo):
+                return False
+
             tz = self._get_cfg("basic_settings", "timezone") or None
             now = _now_tz(tz)
             time_fmt = self._get_cfg("basic_settings", "time_format") or "%Y-%m-%d %H:%M"
@@ -2020,7 +2084,11 @@ class Conversa(Star):
             # 发送每个分段
             for segment in segments:
                 message_chain = MessageChain().message(segment)
-                await self.context.send_message(umo, message_chain)
+                send_ok = await self.context.send_message(umo, message_chain)
+                if send_ok is False:
+                    self._mark_proactive_send_failure(umo)
+                    return False
+                self._mark_proactive_send_success(umo)
                 logger.debug(f"[Conversa] ✅ 消息片段已发送: {segment[:50]}...")
                 
                 # 如果有多个分段，添加短暂延迟（模拟分段回复的间隔）
@@ -2029,6 +2097,8 @@ class Conversa(Star):
             return True
              
         except Exception as e:
+            if not send_event:
+                self._mark_proactive_send_failure(umo, e)
             logger.error(f"[Conversa] ❌ 发送消息失败({umo}): {e}")
             return False
 
@@ -2039,6 +2109,8 @@ class Conversa(Star):
             result = event.get_result()
             if result and result.chain:
                 await event.send(result)
+                if not getattr(event, "_conversa_send_tracked", False):
+                    self._mark_proactive_send_success(event.unified_msg_origin)
                 event.clear_result()
                 return True
             event.clear_result()
@@ -2060,8 +2132,15 @@ class Conversa(Star):
 
         async def tracked_send(*args, **kwargs):
             nonlocal send_count
-            result = await original_send(*args, **kwargs)
+            try:
+                result = await original_send(*args, **kwargs)
+            except Exception as e:
+                if not getattr(event, "_conversa_send_tracked", False):
+                    self._mark_proactive_send_failure(event.unified_msg_origin, e)
+                raise
             send_count += 1
+            if not getattr(event, "_conversa_send_tracked", False):
+                self._mark_proactive_send_success(event.unified_msg_origin)
             return result
 
         event.send = tracked_send
